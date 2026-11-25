@@ -354,6 +354,9 @@ int asb_connector_init(struct asb_device *asb)
 		return ret;
 	drm_connector_helper_add(&asb->connector, &asb_connector_helper_funcs);
 
+	/* DRM does not attach the EDID property to virtual connectors by default. */
+	drm_connector_attach_edid_property(&asb->connector);
+
 	/* Both descriptors are fixed for this VM. Window resizing changes modes only. */
 	ret = asb_set_monitor_edid(asb);
 	if (ret)

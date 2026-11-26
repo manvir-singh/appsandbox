@@ -104,11 +104,27 @@
                 <span class="host-info">Downloaded on first create (~600 MB), cached on the host</span>
             </div>
 
-            <label for="hdd-size">HDD Size:</label>
-            <div class="form-row">
+            <label for="disk-type" id="disk-type-label" hidden>Disk Type:</label>
+            <div class="form-row" id="disk-type-row" hidden>
+                <select id="disk-type" onchange="onDiskTypeChange()">
+                    <option value="vhdx">VHDX file</option>
+                    <option value="physical">Physical disk</option>
+                </select>
+            </div>
+
+            <label for="hdd-size" id="vhdx-label">HDD Size:</label>
+            <div class="form-row" id="vhdx-row">
                 <input type="number" id="hdd-size" value="64" min="64" class="input-sm"> GB
                 <button id="btn-disk-location" class="disk-location-btn" aria-haspopup="dialog" title="HDD Location" onclick="openDiskLocationModal()">HDD location...</button>
                 <span class="host-info" id="host-hdd"></span>
+            </div>
+
+            <label for="physical-disk" id="physical-disk-label" hidden>Physical Disk:</label>
+            <div class="form-row" id="physical-disk-row" hidden>
+                <select id="physical-disk" aria-describedby="physical-disk-status" onchange="onPhysicalDiskSelection()" disabled></select>
+                <button id="refresh-physical-disks" onclick="refreshPhysicalDisks()">Refresh</button>
+                <button id="make-physical-disk-writable" onclick="makePhysicalDiskWritable()" hidden>Make writable</button>
+                <span class="host-info" id="physical-disk-status" role="status"></span>
             </div>
 
             <label for="ram-size">RAM Size:</label>

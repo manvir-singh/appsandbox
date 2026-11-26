@@ -17,6 +17,7 @@ let diskSpaceRequestId = 0;
 let diskSpaceTimer = null;
 let diskSpacePending = false;
 let diskDirectoryBeforeEdit = null;
+let physicalDiskRequestId = 0;
 let rowCache = {};
 let rowSigCache = {};
 
@@ -108,9 +109,8 @@ function applyOsTypeUI() {
     var isLinux = osType === 'ubuntu2604lts';
     var selected = currentTemplates.find(function(t) { return t.name === document.getElementById('template-select').value; });
     if (selected && selected.osType !== osType) selectTemplate('', templateDefaultLabel());
-    modal.querySelectorAll('.templates-supported').forEach(function(el) {
-        el.style.display = (isWindows || osType === 'macos27') ? '' : 'none';
-    });
+    if (!isWindows) document.getElementById('disk-type').value = 'vhdx';
+    applyDiskTypeUI();
     populateTemplates(currentTemplates);
     updateDiskMinimum();
     var winOnly = modal.querySelectorAll('.win-only');
@@ -160,6 +160,7 @@ window.onHostMessage = function(msg) {
         case 'browseResult':  onBrowseResult(msg.path); break;
         case 'diskDirectoryBrowseResult': onDiskDirectoryBrowseResult(msg.path); break;
         case 'diskSpace':     onDiskSpace(msg); break;
+        case 'physicalDisks': onPhysicalDisks(msg); break;
         case 'vmEditResult':
             if (pendingVmEdit && pendingVmEdit.requestId === msg.requestId) {
                 pendingVmEdit.resolve(msg.error || true);
@@ -173,7 +174,8 @@ window.onHostMessage = function(msg) {
         case 'adapters':      populateAdapters(msg); break;
         case 'templates':     populateTemplates(msg.templates); break;
         case 'alert':
-            if (pendingConfirm && pendingConfirm.working) appendLog(msg.message);
+            if (pendingConfirm && (pendingConfirm.working ||
+                (usesPhysicalDisk() && document.getElementById('create-vm-overlay').inert))) appendLog(msg.message);
             else showModal('Error', msg.message, 'OK');
             break;
         case 'prereqRequired': onPrereqRequired(); break;
@@ -350,6 +352,95 @@ function onDiskSpace(msg) {
     };
     updateDiskSpaceInfo();
     updateCreateButtons();
+}
+
+function usesPhysicalDisk() {
+    return !hostBridge.isMac && document.getElementById('os-type').value === 'windows11' &&
+        document.getElementById('disk-type').value === 'physical';
+}
+
+function applyDiskTypeUI() {
+    var osType = document.getElementById('os-type').value;
+    var supportsPhysical = !hostBridge.isMac && osType === 'windows11';
+    var physical = usesPhysicalDisk();
+    document.getElementById('disk-type-label').hidden = !supportsPhysical;
+    document.getElementById('disk-type-row').hidden = !supportsPhysical;
+    document.getElementById('vhdx-label').hidden = physical;
+    document.getElementById('vhdx-row').hidden = physical;
+    document.getElementById('physical-disk-label').hidden = !physical;
+    document.getElementById('physical-disk-row').hidden = !physical;
+    document.querySelectorAll('#create-vm-overlay .templates-supported').forEach(function(el) {
+        el.style.display = !physical && (osType === 'windows11' || osType === 'macos27') ? '' : 'none';
+    });
+}
+
+function onDiskTypeChange() {
+    applyDiskTypeUI();
+    if (usesPhysicalDisk()) {
+        selectTemplate('', templateDefaultLabel());
+        refreshPhysicalDisks();
+    }
+    updateCreateButtons();
+}
+
+function refreshPhysicalDisks(makeWritableId) {
+    document.getElementById('physical-disk').disabled = true;
+    document.getElementById('make-physical-disk-writable').hidden = true;
+    document.getElementById('physical-disk-status').textContent = makeWritableId
+        ? 'Clearing the Windows read-only setting…' : 'Checking disks…';
+    updateCreateButtons();
+    sendCmd(makeWritableId ? 'makePhysicalDiskWritable' : 'getPhysicalDisks', {
+        requestId: ++physicalDiskRequestId, physicalDiskId: makeWritableId
+    });
+}
+
+function selectedPhysicalDiskIsReadOnly() {
+    var option = document.getElementById('physical-disk').selectedOptions[0];
+    return !!option && option.dataset.readOnly === 'true';
+}
+
+function onPhysicalDiskSelection() {
+    var select = document.getElementById('physical-disk');
+    var readOnly = !select.disabled && selectedPhysicalDiskIsReadOnly();
+    document.getElementById('make-physical-disk-writable').hidden = !readOnly;
+    if (!select.disabled) {
+        document.getElementById('physical-disk-status').textContent = readOnly
+            ? 'This clears the Windows read-only setting and keeps the disk offline.'
+            : 'Windows Setup will erase this disk.';
+    }
+    updateCreateButtons();
+}
+
+function makePhysicalDiskWritable() {
+    var select = document.getElementById('physical-disk');
+    if (usesPhysicalDisk() && !select.disabled && select.value && selectedPhysicalDiskIsReadOnly())
+        refreshPhysicalDisks(select.value);
+}
+
+function onPhysicalDisks(msg) {
+    if (msg.requestId !== physicalDiskRequestId || !usesPhysicalDisk() ||
+        !document.getElementById('create-vm-overlay').classList.contains('active')) return;
+    var select = document.getElementById('physical-disk');
+    var previousId = select.value;
+    var disks = msg.error ? [] : msg.disks;
+    var idCounts = new Map();
+    disks.forEach(function(disk) {
+        var id = disk.id.toLowerCase();
+        idCounts.set(id, (idCounts.get(id) || 0) + 1);
+    });
+    select.replaceChildren(new Option('Select a disk…', ''));
+    disks.sort(function(a, b) { return a.number - b.number; }).forEach(function(disk) {
+        if (idCounts.get(disk.id.toLowerCase()) !== 1) return;
+        var label = 'Disk ' + disk.number + (disk.name ? ' · ' + disk.name : '') + ' · ' + disk.sizeGb + ' GB';
+        if (disk.readOnly) label += ' (read-only)';
+        var option = new Option(label, disk.id, false, disk.id === previousId);
+        option.dataset.readOnly = String(disk.readOnly);
+        select.add(option);
+    });
+    select.disabled = select.options.length < 2;
+    if (select.disabled) document.getElementById('physical-disk-status').textContent =
+        msg.error || 'No eligible offline physical disks detected.';
+    onPhysicalDiskSelection();
 }
 
 /* ---- Adapters ---- */
@@ -580,12 +671,14 @@ document.getElementById('disk-location-overlay').addEventListener('click', funct
 
 function createValidationError(isTemplate) {
     var osType = document.getElementById('os-type').value;
+    var physical = usesPhysicalDisk();
+    if (physical && isTemplate) return 'Templates use VHDX files.';
     if (isTemplate && osType !== 'windows11' && osType !== 'macos27')
         return 'Templates require a Windows or macOS guest.';
     if (isTemplate && document.getElementById('template-select').value)
         return 'Select an OS image to build a new template.';
     var error = validateVmName(document.getElementById('vm-name').value.trim()) ||
-        validateDiskDirectory(document.getElementById('disk-directory').value.trim()) ||
+        (!physical && validateDiskDirectory(document.getElementById('disk-directory').value.trim())) ||
         validateUsername(document.getElementById('admin-user').value.trim(), isTemplate) ||
         validatePassword(document.getElementById('admin-pass').value);
     if (error) return error;
@@ -593,13 +686,22 @@ function createValidationError(isTemplate) {
         return 'Passwords do not match.';
 
     var numericFields = [
-        ['hdd-size', 'Disk size must be a whole number of at least ' + document.getElementById('hdd-size').min + ' GB.'],
         ['ram-size', 'RAM must be an even number of at least 4096 MB.'],
         ['cpu-cores', 'CPU cores must be a whole number of at least 1.']
     ];
+    if (!physical) numericFields.unshift(
+        ['hdd-size', 'Disk size must be a whole number of at least ' + document.getElementById('hdd-size').min + ' GB.']);
     for (var i = 0; i < numericFields.length; i++) {
         var input = document.getElementById(numericFields[i][0]);
         if (input.value === '' || !input.validity.valid) return numericFields[i][1];
+    }
+
+    var hasImage = document.getElementById('image-path').value.trim() !== '';
+    if (physical) {
+        var diskSelect = document.getElementById('physical-disk');
+        if (diskSelect.disabled || !diskSelect.value) return 'Select an available physical disk.';
+        if (selectedPhysicalDiskIsReadOnly()) return 'Make the selected disk writable before installing Windows.';
+        return hasImage ? null : 'Select a Windows 11 ISO.';
     }
 
     var path = selectedDiskDirectory();
@@ -607,7 +709,6 @@ function createValidationError(isTemplate) {
     if (diskKnown && diskSpaceInfo.freeGb < 0) return 'Disk folder is unavailable.';
     if (diskSpacePending && !diskKnown) return 'Checking disk folder...';
 
-    var hasImage = document.getElementById('image-path').value.trim() !== '';
     var hasTemplate = (osType === 'windows11' || osType === 'macos27') &&
         document.getElementById('template-select').value !== '';
     if (osType !== 'macos27' && !hasImage && (isTemplate || !hasTemplate))
@@ -705,6 +806,7 @@ onNetModeChange();
 
 function gatherConfig() {
     var osType = document.getElementById('os-type').value;
+    var physical = usesPhysicalDisk();
     var gpu = selectedGpu('gpu-mode');
     /* Same ISO-picker path for Windows and Linux. The cloud-image
        Linux-version dropdown is dormant (see applyOsTypeUI). */
@@ -713,12 +815,13 @@ function gatherConfig() {
         name:        document.getElementById('vm-name').value.trim(),
         osType:      osType,
         imagePath:   imagePath,
-        diskDirectory: document.getElementById('disk-directory').value.trim() ===
+        diskDirectory: physical || document.getElementById('disk-directory').value.trim() ===
             (lastHostInfo && lastHostInfo.defaultDiskDirectory) ? '' :
             document.getElementById('disk-directory').value.trim(),
         templateName: selectedTemplateId ? undefined : document.getElementById('template-select').value,
         templateId: selectedTemplateId || undefined,
-        hddGb:       document.getElementById('hdd-size').valueAsNumber,
+        hddGb:       physical ? undefined : document.getElementById('hdd-size').valueAsNumber,
+        physicalDiskId: physical ? document.getElementById('physical-disk').value : undefined,
         ramMb:       alignRamMb(document.getElementById('ram-size').valueAsNumber),
         cpuCores:    document.getElementById('cpu-cores').valueAsNumber,
         gpuMode:     gpu.gpuMode,
@@ -861,9 +964,25 @@ function validatePassword(pass) {
     return null;
 }
 
-function onCreateVm() {
+async function onCreateVm() {
+    if (pendingConfirm) return;
     var error = createValidationError(false);
     if (error) { sendCmd('log', { message: error }); updateCreateButtons(); return; }
+    if (usesPhysicalDisk()) {
+        var overlay = document.getElementById('create-vm-overlay');
+        var disk = document.getElementById('physical-disk').selectedOptions[0];
+        var confirmation = showModal('Erase Physical Disk',
+            'Installing Windows will erase all data on ' + disk.textContent + '.', 'Erase and Install');
+        overlay.inert = true;
+        document.getElementById('modal-cancel-btn').focus();
+        var confirmed = await confirmation;
+        overlay.inert = false;
+        if (!confirmed || !overlay.classList.contains('active') || createValidationError(false) ||
+            document.getElementById('physical-disk').value !== disk.value) {
+            if (overlay.classList.contains('active')) document.getElementById('physical-disk').focus();
+            return;
+        }
+    }
     var cfg = gatherConfig();
     sendCmd('createVm', cfg);
     clearCreateForm();
@@ -885,6 +1004,8 @@ function onCreateTemplate() {
 function openCreateModal() {
     closeDiskLocationModal(false);
     /* Reset to defaults every time the modal opens */
+    document.getElementById('disk-type').value = 'vhdx';
+    document.getElementById('physical-disk').replaceChildren();
     document.getElementById('vm-name').value = 'MyAppSandbox';
     document.getElementById('image-path').value = '';
     document.getElementById('disk-directory').value = (lastHostInfo && lastHostInfo.defaultDiskDirectory) || '';
@@ -1109,7 +1230,7 @@ function buildRowCells(vm, i, statusTd) {
         agentTd,
         makeCell(vm.cpuCores, 'Number of virtual CPU cores assigned to this VM'),
         makeCell(vm.ramMb + ' MB', 'Memory allocated to this VM, in megabytes'),
-        makeCell(vm.hddGb + ' GB', 'Virtual disk size, in gigabytes'),
+        makeCell(vm.hddGb + ' GB', vm.physicalDisk ? 'Physical disk capacity, in gigabytes' : 'Virtual disk size, in gigabytes'),
         makeCell(vm.gpuName || (vm.gpuMode === 1 ? 'Default GPU' : 'None'),
             hostBridge.isMac && vm.osType === 'windows11'
                 ? 'Windows software rendering (WARP) on the CPU'
@@ -1120,12 +1241,12 @@ function buildRowCells(vm, i, statusTd) {
     ];
     if (!hostBridge.isMac) cells.push(makeSnapCell(vm, i));
     cells.push(
-        makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, function() { onStartVm(vmIndexById(vm.id)); }, '', 'Start the VM (boots from the selected snapshot/branch)'),
-        makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmId: vm.id}); }, '', 'Open the VM display window (IDD virtual monitor)'),
+        makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, function() { onStartVm(vmIndexById(vm.id)); }, '', vm.physicalDisk ? 'Boot from the physical disk' : 'Start the VM (boots from the selected snapshot/branch)'),
+        makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmId: vm.id}); }, '', 'Open the VM display'),
         sshCell,
         makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmId: vm.id}); }, '', 'Request a graceful shutdown from the guest OS'),
         makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(vmIndexById(vm.id)); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
-        makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(vmIndexById(vm.id)); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
+        makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(vmIndexById(vm.id)); }, vm.running ? 'running' : '', vm.physicalDisk ? 'Delete this VM and release its disk assignment' : 'Delete this VM and its virtual disks'),
         makeIconCell('edit', '\u270F\uFE0F', canEditVm(vm), function() { openEditVmModal(vmIndexById(vm.id)); }, '', 'Edit VM configuration — VM must be stopped and fully installed'),
     );
     return cells;
@@ -1191,7 +1312,7 @@ function renderVmTable() {
             i, i === selectedVm, vm.name,
             vm.running, vm.starting, vm.buildingVhdx, vm.shuttingDown, vm.agentOnline,
             vm.agentVersion,
-            vm.installComplete, vm.isTemplate,
+            vm.installComplete, vm.isTemplate, vm.physicalDisk,
             vm.sshEnabled, vm.sshState, vm.sshPort,
             vm.osType, vm.osName, vm.ramMb, vm.hddGb, vm.cpuCores,
             vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode,
@@ -1394,7 +1515,8 @@ function updateEditVmModal() {
     document.querySelectorAll('#edit-vm-overlay input, #edit-vm-overlay select').forEach(function(el) {
         el.disabled = !!disabled;
     });
-    var diskError = vm.hasSnapshots ? 'Disk growth requires a VM without snapshots or branches.' : vm.diskResizeAgentError;
+    var diskError = vm.physicalDisk ? 'Physical disks have a fixed capacity.' :
+        vm.hasSnapshots ? 'Disk growth requires a VM without snapshots or branches.' : vm.diskResizeAgentError;
     disk.disabled = disabled || !!diskError;
     disk.parentElement.title = diskError || '';
     var values = editVmValues();
@@ -1546,7 +1668,9 @@ function onDeleteVm(idx) {
     if (vm.isTemplate) { onStopVm(idx); return; }
     showModal(
         'Confirm Delete',
-        'Are you sure you want to delete VM "' + vm.name + '"?\n\nThis will permanently delete all disk data and snapshots.',
+        'Are you sure you want to delete VM "' + vm.name + '"?\n\n' + (vm.physicalDisk
+            ? 'This removes the VM configuration and releases the physical disk assignment. Data on the physical disk is preserved.'
+            : 'This will permanently delete all disk data and snapshots.'),
         'Delete'
     ).then(function(confirmed) {
         if (confirmed) {
@@ -1598,6 +1722,11 @@ function snapshotPath(vm, value) {
 function makeSnapCell(vm, vmIdx) {
     var td = document.createElement('td');
     td.className = 'snap-cell';
+    if (vm.physicalDisk) {
+        td.textContent = '—';
+        td.title = 'Snapshots are unavailable for physical disks';
+        return td;
+    }
     var button = document.createElement('button');
     button.className = 'snap-open';
     button.textContent = vm.hasSnapshots ? snapshotPath(vm, selectedSnap.get(vm.id) || 'current') : 'No snapshots';
@@ -1610,7 +1739,7 @@ function makeSnapCell(vm, vmIdx) {
 
 function openSnapshotModal(idx) {
     var vm = vms[idx];
-    if (!vm || hostBridge.isMac) return;
+    if (!vm || hostBridge.isMac || vm.physicalDisk) return;
     var value = selectedSnap.get(vm.id) || 'current';
     snapshotModal = {
         id: vm.id, name: vm.name,

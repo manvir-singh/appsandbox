@@ -269,7 +269,7 @@ static void build_host_info_json(JsonBuilder *jb)
     for (i = 0; i < count; i++) {
         VmInstance *v = asb_vm_instance(asb_vm_get(i));
         if (v && v->running) { vm_cores += v->cpu_cores; vm_ram_mb += v->ram_mb; }
-        if (v) vm_hdd_gb += v->hdd_gb;
+        if (v && !v->physical_disk_id[0]) vm_hdd_gb += v->hdd_gb;
     }
 
     asb_default_disk_directory(base_dir, MAX_PATH);
@@ -332,6 +332,7 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_string(jb, L"osName", asb_api_guest_os_name(v->os_type));
     asb_vm_disk_directory(asb_vm_get(i), disk_directory, MAX_PATH);
     jb_string(jb, L"diskDirectory", disk_directory);
+    jb_bool(jb, L"physicalDisk", v->physical_disk_id[0] != L'\0');
     jb_bool(jb, L"running", v->running);
     jb_bool(jb, L"starting", v->starting);
     jb_bool(jb, L"shuttingDown", v->shutdown_requested);
@@ -517,6 +518,43 @@ static void send_edid_sources(void)
     jb_array_begin(&jb, L"monitors");
     enum_monitor_edid_sources(append_edid_source, &jb);
     jb_array_end(&jb);
+    jb_object_end(&jb);
+    webview2_post(buf);
+}
+
+static void append_physical_disk(const wchar_t *id, const wchar_t *name, DWORD number,
+                                 DWORD size_gb, BOOL read_only, void *context)
+{
+    JsonBuilder *jb = context;
+    if (jb->cap - jb->len < 6 * (wcslen(id) + wcslen(name)) + 256) return;
+    if (jb->count) jb_append(jb, L",");
+    jb_object_begin(jb);
+    jb_string(jb, L"id", id);
+    jb_string(jb, L"name", name);
+    jb_int(jb, L"number", (int)number);
+    jb_int(jb, L"sizeGb", (int)size_gb);
+    jb_bool(jb, L"readOnly", read_only);
+    jb_object_end(jb);
+}
+
+static void send_physical_disks(int request_id, const wchar_t *error)
+{
+    wchar_t buf[32768];
+    JsonBuilder jb;
+    jb_init(&jb, buf, ARRAYSIZE(buf));
+    jb_object_begin(&jb);
+    jb_string(&jb, L"type", L"physicalDisks");
+    jb_int(&jb, L"requestId", request_id);
+    jb_array_begin(&jb, L"disks");
+    if (!error) {
+        HRESULT hr = g_prereq_ok ? asb_enum_physical_disks(append_physical_disk, &jb) : E_NOT_VALID_STATE;
+        if (FAILED(hr)) {
+            ui_log(L"Could not list physical disks (0x%08X).", hr);
+            error = L"Could not list physical disks.";
+        }
+    }
+    jb_array_end(&jb);
+    if (error) jb_string(&jb, L"error", error);
     jb_object_end(&jb);
     webview2_post(buf);
 }
@@ -728,19 +766,6 @@ static void do_connect_idd(int idx)
     asb_events_changed();
 }
 
-/* User-initiated Connect: open BOTH the IDD display and the RDP
-   basic-session display side-by-side.
-     - IDD renders the in-VM agent's captured framebuffer (Windows: VDD,
-       Linux: appsandbox-display via vsock :2). Empty until the agent
-       comes online.
-     - RDP renders the Hyper-V Video adapter framebuffer via vmwp.exe's
-       BasicSession named pipe. Works from BIOS / GRUB onward, no guest
-       cooperation needed. Crucial for debugging install / first boot —
-       you can watch cloud-init, kernel messages, GDM coming up.
-   Both windows are independent; either can be closed manually. The
-   automatic RDP -> IDD switching handlers (WM_VM_AGENT_ONLINE,
-   WM_VM_HYPERV_VIDEO_OFF) keep using the per-display functions so they
-   can close one without re-opening the other. */
 static void do_connect_vm(int idx)
 {
     VmInstance *vm;
@@ -749,13 +774,8 @@ static void do_connect_vm(int idx)
     vm = asb_vm_instance(asb_vm_get(idx));
     if (!vm || !vm->running) return;
     asb_vm_set_display_suppressed((AsbVm)vm, FALSE);
-    /* Direct ISO->VHDX flow boots straight into the configured rootfs with
-       IDD live from the start, so the RDP fallback window is no longer
-       needed. do_connect_rdp() + vm_display.c stay on disk as reference
-       for the RDP-over-named-pipe pattern but are no longer invoked.
-       The g_displays[]/safe_destroy_rdp cleanup paths remain inert
-       because nothing populates the slots. */
-    do_connect_idd(idx);
+    if (vm->physical_disk_id[0] && !vm->install_complete) do_connect_rdp(idx);
+    else do_connect_idd(idx);
 }
 
 BOOL ui_display_is_open(UINT64 id)
@@ -1115,6 +1135,26 @@ static void handle_webview2_message(const wchar_t *json)
         send_edid_sources();
     } else if (wcscmp(action, L"getAdapters") == 0) {
         send_adapters();
+    } else if (wcscmp(action, L"getPhysicalDisks") == 0) {
+        int request_id;
+        if (json_get_int(json, L"requestId", &request_id)) send_physical_disks(request_id, NULL);
+    } else if (wcscmp(action, L"makePhysicalDiskWritable") == 0) {
+        int request_id;
+        wchar_t id[MAX_PATH];
+        if (!json_get_int(json, L"requestId", &request_id)) return;
+        HRESULT hr = E_INVALIDARG;
+        if (g_prereq_ok && json_get_string(json, L"physicalDiskId", id, ARRAYSIZE(id)) && id[0])
+            hr = asb_make_physical_disk_writable(id);
+        if (FAILED(hr)) {
+            ui_log(L"Could not clear the disk's read-only setting (0x%08X).", hr);
+            if (hr == HRESULT_FROM_WIN32(ERROR_WRITE_PROTECT))
+                ui_show_alert(L"Windows still reports that the disk is write-protected.");
+            else if (hr == HRESULT_FROM_WIN32(ERROR_NOT_READY) || hr == HRESULT_FROM_WIN32(ERROR_BUSY))
+                ui_show_alert(L"The selected disk must still be offline and available.");
+            else
+                ui_show_alert(L"Windows could not clear the disk's read-only setting. See the Log for the error code.");
+        }
+        send_physical_disks(request_id, NULL);
     } else if (wcscmp(action, L"createVm") == 0) {
         if (!g_prereq_ok) {
             webview2_post(g_prereq_reboot_pending
@@ -1127,6 +1167,7 @@ static void handle_webview2_message(const wchar_t *json)
         wchar_t tpl_buf[256] = {0}, user_buf[128] = {0}, pass_buf[256] = {0};
         wchar_t adapter_buf[256] = {0}, disk_buf[MAX_PATH + 1] = {0};
         wchar_t gpu_id[512] = {0};
+        wchar_t physical_disk_id[MAX_PATH] = {0};
         int val;
         BOOL is_tpl = FALSE;
 
@@ -1173,7 +1214,15 @@ static void handle_webview2_message(const wchar_t *json)
         }
         if (!json_get_string(json, L"diskDirectory", disk_buf, MAX_PATH + 1) &&
             json_has_key(json, L"diskDirectory")) {
+            SecureZeroMemory(pass_buf, sizeof(pass_buf));
             ui_show_alert(L"Disk folder is invalid or too long.");
+            return;
+        }
+        if (json_has_key(json, L"physicalDiskId") &&
+            (!json_get_string(json, L"physicalDiskId", physical_disk_id, ARRAYSIZE(physical_disk_id)) ||
+             !physical_disk_id[0])) {
+            SecureZeroMemory(pass_buf, sizeof(pass_buf));
+            ui_show_alert(L"Physical disk selection is invalid.");
             return;
         }
         json_get_bool(json, L"isTemplate", &is_tpl);
@@ -1224,8 +1273,19 @@ static void handle_webview2_message(const wchar_t *json)
             ui_show_alert(L"Could not read the selected monitor's EDID. Reopen New Sandbox to refresh the display list.");
             return;
         }
-        asb_vm_create_with_edid(&cfg, NULL, edid_source[0] ? &edid : NULL);
+        const AsbEdid *selected_edid = edid_source[0] ? &edid : NULL;
+        AsbVmId created_id = 0;
+        if (physical_disk_id[0]) {
+            if (FAILED(asb_vm_create_on_physical_disk(&cfg, &created_id, selected_edid, physical_disk_id)))
+                created_id = 0;
+        } else {
+            asb_vm_create_with_edid(&cfg, NULL, selected_edid);
+        }
         SecureZeroMemory(pass_buf, sizeof(pass_buf));
+        if (created_id) {
+            VmInstance *vm = asb_find_vm_by_id(created_id);
+            if (vm && vm->running && !vm->install_complete) do_connect_vm(asb_vm_index((AsbVm)vm));
+        }
         send_vm_list();
     } else if (wcscmp(action, L"startVm") == 0) {
         if (!g_prereq_ok) {
@@ -1365,8 +1425,11 @@ static void handle_webview2_message(const wchar_t *json)
                     int hdd_gb;
                     if (api_json_get_int(json, L"value", &hdd_gb))
                         hr = asb_vm_set_disk_size(vm, (DWORD)hdd_gb);
-                    if (hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED))
-                        error = L"Disk growth requires a completed VM without snapshots or branches.";
+                    if (hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)) {
+                        VmInstance *vm_instance = asb_vm_instance(vm);
+                        error = vm_instance->physical_disk_id[0] ? L"Physical disks have a fixed capacity."
+                                                                : L"Disk growth requires a completed VM without snapshots or branches.";
+                    }
                     else if (hr == HRESULT_FROM_WIN32(ERROR_NOT_CAPABLE))
                         error = L"" ASB_DISK_GROW_AGENT_ERROR;
                     else if (hr == E_INVALIDARG)
@@ -1553,8 +1616,13 @@ static void on_webview2_message(const wchar_t *json)
 {
     if (g_command_depth || asb_api_busy()) {
         const wchar_t *error = L"Another VM operation is in progress. Please try again when it finishes.";
-        wchar_t action[64];
-        if (json_get_string(json, L"action", action, ARRAYSIZE(action)) && wcscmp(action, L"editVm") == 0)
+        wchar_t action[64] = {0};
+        int request_id;
+        json_get_string(json, L"action", action, ARRAYSIZE(action));
+        if ((wcscmp(action, L"getPhysicalDisks") == 0 || wcscmp(action, L"makePhysicalDiskWritable") == 0) &&
+            json_get_int(json, L"requestId", &request_id))
+            send_physical_disks(request_id, error);
+        else if (wcscmp(action, L"editVm") == 0)
             send_vm_edit_result(json, error);
         else
             ui_show_alert(error);

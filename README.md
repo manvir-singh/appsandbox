@@ -20,6 +20,7 @@ Windows features:
 - Snapshots
 - Multiple resolution options as well as optional dynamic resolution, and fullscreen mode
 - Host to client hot-key support
+- Game controller forwarding to Windows and Ubuntu guests, including Steam Input Gamepad layouts
 - Provision and boot with / without internet
 - Supports running Claude Cowork and Docker inside the VM thanks to Nested Virtualization Support
 - Local API, MCP server, and Python SDK
@@ -105,6 +106,23 @@ Want to give your old VM the new App Sandbox features? Download and run the new 
 [Windows] Enter fullscreen mode my right clicking the title bar and selecting borderless fullscreen mode.  To exit this mode hold your mouse up on the top of the screen for about 1 second, then you'll see an option to exit.
 
 When your VM is running and open, right clicking its title bar will show several options like transmit hotkeys, mute audio and match window size where your VM display dynamically resizes to your viewers size.
+
+### Game controllers on a Windows host
+
+1. For a Windows guest, install [ViGEmBus 1.22.0](https://github.com/nefarius/ViGEmBus/releases/tag/v1.22.0)
+   inside the guest, then reopen the VM viewer. Ubuntu guests use the kernel's
+   `uinput` driver.
+2. For Steam Input, add App Sandbox to the host Steam library as a non-Steam
+   game, choose a **Gamepad** layout, and launch it from Steam with the overlay
+   enabled. App Sandbox runs elevated, so Steam must be able to attach its
+   overlay to the elevated viewer. Native XInput controllers also work when
+   you launch App Sandbox directly.
+
+**Forward game controllers** is enabled by default when the guest provides
+controller support. The viewer options can turn it off. The focused guest
+receives buttons, the D-pad, both sticks, and both triggers from up to four
+pads. Switching focus releases held inputs. Windows guests can check the
+virtual Xbox 360 controller in `joy.cpl`.
 
 [Windows] Need a high performance remote desktop to remotely access your VM? [Phaze](https://phaze.app) works well  
 

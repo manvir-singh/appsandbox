@@ -13,6 +13,7 @@
 
 #include <winsock2.h>
 #include <windows.h>
+#include <xinput.h>
 
 #define COBJMACROS
 #include <initguid.h>
@@ -59,6 +60,7 @@
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "avrt.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "xinput.lib")
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -334,6 +336,8 @@ struct VmDisplayIdd {
     InputPacket    held_keys[768];
     BYTE           hook_routes[768];
     BOOL           input_menu_active;
+    volatile BOOL  gamepad_supported;
+    BOOL           gamepads_disabled;
 
     /* Guest cursor */
     HCURSOR        guest_cursor;    /* current cursor created from guest bitmap */
@@ -391,10 +395,11 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_SEND_SAS       0x1060
 #define IDM_FULLSCREEN     0x1070
 #define IDM_LOSSLESS_COMPRESSION 0x1080
+#define IDM_GAMEPADS       0x1090
 /* Order matches the data-option indices in the fullscreen viewer menu. */
 static const UINT g_viewer_commands[] = {
     IDM_SEND_SAS, IDM_MATCH_WINDOW, IDM_SHARE_CLIPBOARD,
-    IDM_XMIT_HOTKEYS, IDM_AUDIO_MUTE, IDM_LOSSLESS_COMPRESSION
+    IDM_XMIT_HOTKEYS, IDM_AUDIO_MUTE, IDM_LOSSLESS_COMPRESSION, IDM_GAMEPADS
 };
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
@@ -641,6 +646,33 @@ static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT3
     AcquireSRWLockExclusive(&d->input_lock);
     send_input_locked(d, type, p1, p2, p3);
     ReleaseSRWLockExclusive(&d->input_lock);
+}
+
+static void idd_poll_gamepads(VmDisplayIdd *d)
+{
+    if (!d->gamepad_supported) return;
+
+    AsbGamepadState states[INPUT_GAMEPAD_SLOTS] = {0};
+    UINT32 connected = 0;
+    BOOL active = !d->stop && d->frame_connected && d->input_focused &&
+                  !d->input_menu_active && !d->input_sizing && !IsIconic(d->hwnd) &&
+                  GetForegroundWindow() == d->hwnd && d->agent_control != ASB_CONTROL_AGENT;
+
+    /* Steam Input's Gamepad layout exposes Xbox-compatible state through XInput. */
+    if (active && !d->gamepads_disabled) {
+        for (DWORD slot = 0; slot < INPUT_GAMEPAD_SLOTS; ++slot) {
+            XINPUT_STATE state;
+            if (XInputGetState(slot, &state) != ERROR_SUCCESS) continue;
+            const XINPUT_GAMEPAD *pad = &state.Gamepad;
+            states[slot] = (AsbGamepadState){ pad->wButtons, pad->bLeftTrigger, pad->bRightTrigger,
+                pad->sThumbLX, pad->sThumbLY, pad->sThumbRX, pad->sThumbRY };
+            connected |= 1u << slot;
+        }
+    }
+
+    AcquireSRWLockShared(&d->input_lock);
+    asb_input_gamepads(d->input, (active || d->gamepads_disabled) ? states : NULL, connected);
+    ReleaseSRWLockShared(&d->input_lock);
 }
 
 static BOOL idd_clip_mouse(VmDisplayIdd *d)
@@ -1251,6 +1283,7 @@ static DWORD WINAPI idd_input_thread_proc(LPVOID param)
         d->input_socket=status.connection;
         d->keyboard_version=status.keyboard_version?status.keyboard_version:1;
         d->mouse_version=status.mouse_version;
+        d->gamepad_supported=status.gamepad_version==INPUT_GAMEPAD_VERSION;
         ReleaseSRWLockExclusive(&d->input_lock);
         if (changed) PostMessageW(d->hwnd,WM_IDD_INPUT_READY,0,0);
         Sleep(100);
@@ -1258,6 +1291,7 @@ static DWORD WINAPI idd_input_thread_proc(LPVOID param)
     AcquireSRWLockExclusive(&d->input_lock);
     d->input=NULL;d->input_socket=INVALID_SOCKET;
     d->keyboard_version=1;d->mouse_version=0;
+    d->gamepad_supported=FALSE;
     ZeroMemory(d->held_down,sizeof(d->held_down));
     ReleaseSRWLockExclusive(&d->input_lock);
     asb_input_viewer(input,FALSE);
@@ -3278,6 +3312,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
                             L"Automatically disable non AppSandbox displays");
             AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_MATCH_WINDOW, L"Match window size");
             AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_LOSSLESS_COMPRESSION, L"Lossless compression");
+            AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_GAMEPADS, L"Forward game controllers");
             if (!_wcsicmp(d->os_type, L"Windows"))
                 AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_SEND_SAS, L"Send Ctrl+Alt+Del");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
@@ -3466,11 +3501,13 @@ static void idd_viewer_option_state(VmDisplayIdd *d,UINT *enabled,UINT *checked)
     if (d->shared_ready && d->shared_resize && !d->shared_disabled &&
         (d->shared_front>=0 || d->shared_pending>=0)) *enabled|=2;
     if (idd_can_toggle_compression(d)) *enabled|=32;
+    if (d->gamepad_supported) *enabled|=64;
     if (d->size_mode==DISPLAY_SIZE_WINDOW) *checked|=2;
     if (d->share_clipboard) *checked|=4;
     if (d->transmit_hotkeys) *checked|=8;
     if (d->audio_muted) *checked|=16;
     if (d->lossless_compression) *checked|=32;
+    if (d->gamepad_supported && !d->gamepads_disabled) *checked|=64;
 }
 
 static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -3574,6 +3611,13 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 idd_log(d, L"Could not save viewer settings.");
             return 0;
         }
+        if (d && (wp & 0xFFF0) == IDM_GAMEPADS) {
+            if (d->gamepad_supported) {
+                d->gamepads_disabled = !d->gamepads_disabled;
+                idd_poll_gamepads(d);
+            }
+            return 0;
+        }
         if (d && (wp & 0xFFF0) == IDM_MATCH_WINDOW) {
             BOOL enabled;
             enabled = d->shared_ready && d->shared_resize && !d->shared_disabled &&
@@ -3649,6 +3693,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
             /* Stop recv threads */
             d->stop = TRUE;
+            idd_poll_gamepads(d);
             idd_update_relative_mouse(d);
             if (d->shared_wake) SetEvent(d->shared_wake);
             if (d->shared_thread) {
@@ -3799,6 +3844,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_EXITSIZEMOVE:
         if (d) {
             d->input_sizing = msg == WM_ENTERSIZEMOVE;
+            if (d->input_sizing) idd_poll_gamepads(d);
             if (d->size_mode == DISPLAY_SIZE_WINDOW && d->input_sizing &&
                 TryEnterCriticalSection(&d->frame_cs)) {
                 ZeroMemory(&d->size_request, sizeof(d->size_request));
@@ -3830,6 +3876,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->size_update_pending && !d->input_sizing && !IsIconic(hwnd))
                 idd_update_display_size(d, FALSE);
             idd_poll_mouse_position(d);
+            idd_poll_gamepads(d);
             {
                 UINT size = (UINT)InterlockedCompareExchange(&d->rendered_size, 0, 0);
                 agent_overlay_update(d->agent_overlay, d->agent_control, d->agent_x, d->agent_y,
@@ -3902,6 +3949,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ENTERMENULOOP:
         if (d) {
             d->input_menu_active = TRUE;
+            idd_poll_gamepads(d);
             if (d->keyboard_version == INPUT_KEYBOARD_VERSION) idd_flush_held_keys(d);
             idd_flush_mouse_buttons(d);
             idd_update_relative_mouse(d);
@@ -3935,6 +3983,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->clipboard)
                 vm_clipboard_set_sync_enabled(d->clipboard, d->share_clipboard && d->input_focused && !IsIconic(hwnd));
             if (!d->input_focused) {
+                idd_poll_gamepads(d);
                 agent_overlay_cancel_input(d->agent_overlay);
                 idd_flush_held_keys(d);
                 idd_flush_mouse_buttons(d);

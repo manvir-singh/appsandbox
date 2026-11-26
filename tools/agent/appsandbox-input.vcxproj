@@ -123,11 +123,6 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies>ws2_32.lib;user32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
-    <PostBuildEvent>
-      <Command>if not exist "$(SolutionDir)release\resources\" mkdir "$(SolutionDir)release\resources\"
-xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources\"</Command>
-      <Message>Copying appsandbox-input.exe to release\resources\</Message>
-    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -148,15 +143,17 @@ xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources\"</Command>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies>ws2_32.lib;user32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
-    <PostBuildEvent>
-      <Command>if not exist "$(SolutionDir)release\resources\" mkdir "$(SolutionDir)release\resources\"
-xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources\"</Command>
-      <Message>Copying appsandbox-input.exe to release\resources\</Message>
-    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="appsandbox-input.c" />
+    <ClCompile Include="guest_gamepad.c" />
     <ClCompile Include="..\transport\asb_transport.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <!-- The local host provisions guests from the resources folder next to it. -->
+  <Target Name="StageGuestInputHelper" AfterTargets="Build">
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(TargetDir)resources" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(SolutionDir)release\resources"
+          SkipUnchangedFiles="true" Condition="'$(Configuration)' == 'Release'" />
+  </Target>
 </Project>

@@ -14,7 +14,7 @@ struct AsbInputSession {
     AsbInputStatus labels;
     SOCKET connection,negotiating;
     HANDLE thread,stop;
-    UINT32 keyboard,mouse,barrier_done;
+    UINT32 keyboard,mouse,gamepad,barrier_done;
     InputPacket replies[64];
     unsigned head,tail;
     unsigned viewers,claiming,retired;
@@ -45,12 +45,21 @@ static int emit(void *context,const InputPacket *packet)
     if (s->connection==INVALID_SOCKET) return 0;
     int n=send(s->connection,(const char *)packet,sizeof(*packet),0);
     if (n==sizeof(*packet)) return 1;
-    if (n==SOCKET_ERROR && WSAGetLastError()==WSAEWOULDBLOCK) return 0;
+    /* A lost release can leave a held control in the guest. Closing the input
+       stream makes the guest remove its virtual pads even under backpressure. */
+    if (n==SOCKET_ERROR && WSAGetLastError()==WSAEWOULDBLOCK &&
+        packet->type!=INPUT_GAMEPAD_RESET && packet->type!=INPUT_GAMEPAD_DISCONNECT) return 0;
     shutdown(s->connection,SD_BOTH);
     return 0;
 }
 
-static BOOL negotiate(AsbInputSession *session,SOCKET fd,UINT32 *keyboard,UINT32 *mouse,InputPacket *reply,int *got)
+static BOOL gamepad_reply(const InputPacket *packet)
+{
+    return packet->type==INPUT_GAMEPAD_REPLY && !packet->param2 && !packet->param3;
+}
+
+static BOOL negotiate(AsbInputSession *session,SOCKET fd,UINT32 *keyboard,UINT32 *mouse,
+                      UINT32 *gamepad,InputPacket *reply,int *got)
 {
     static volatile LONG request_id;
     UINT32 ready=0;
@@ -60,7 +69,8 @@ static BOOL negotiate(AsbInputSession *session,SOCKET fd,UINT32 *keyboard,UINT32
     if (ioctlsocket(fd,FIONBIO,&nonblock)) return FALSE;
     UINT32 request=(UINT32)InterlockedIncrement(&request_id);
     InputPacket queries[]={{INPUT_MAGIC,INPUT_KEYBOARD_QUERY,INPUT_KEYBOARD_VERSION,request,0},
-        {INPUT_MAGIC,INPUT_MOUSE_QUERY,INPUT_MOUSE_NORMALIZED_VERSION,request,0}};
+        {INPUT_MAGIC,INPUT_MOUSE_QUERY,INPUT_MOUSE_NORMALIZED_VERSION,request,0},
+        {INPUT_MAGIC,INPUT_GAMEPAD_QUERY,INPUT_GAMEPAD_VERSION,0,0}};
     if (send(fd,(const char *)queries,sizeof(queries),0)!=sizeof(queries)) return FALSE;
     BOOL keyboard_reply=FALSE,mouse_reply=FALSE;
     ULONGLONG deadline=GetTickCount64()+500;
@@ -77,7 +87,9 @@ static BOOL negotiate(AsbInputSession *session,SOCKET fd,UINT32 *keyboard,UINT32
         if (n<=0) return FALSE;
         *got+=n;
         if (*got!=(int)sizeof(*reply)) continue;
-        if (reply->magic==INPUT_MAGIC && reply->param2==request && !reply->param3) {
+        if (reply->magic==INPUT_MAGIC && gamepad_reply(reply)) {
+            if (reply->param1==INPUT_GAMEPAD_VERSION) *gamepad=INPUT_GAMEPAD_VERSION;
+        } else if (reply->magic==INPUT_MAGIC && reply->param2==request && !reply->param3) {
             if (reply->type==INPUT_KEYBOARD_REPLY) {
                 keyboard_reply=TRUE;
                 if (reply->param1==INPUT_KEYBOARD_VERSION) *keyboard=INPUT_KEYBOARD_VERSION;
@@ -101,16 +113,16 @@ static DWORD WINAPI worker(void *context)
         if (!needed) { WaitForSingleObject(s->stop,100);continue; }
         SOCKET fd=asb_channel_connect(&s->target,3,1000);
         InputPacket packet={0};int count=0;
-        UINT32 keyboard=1,mouse=0;
+        UINT32 keyboard=1,mouse=0,gamepad=0;
         if (fd==INVALID_SOCKET) goto retry;
         AcquireSRWLockExclusive(&s->lock);
         if (s->retired) { ReleaseSRWLockExclusive(&s->lock);closesocket(fd);break; }
         s->negotiating=fd;ReleaseSRWLockExclusive(&s->lock);
-        BOOL connected=negotiate(s,fd,&keyboard,&mouse,&packet,&count);
+        BOOL connected=negotiate(s,fd,&keyboard,&mouse,&gamepad,&packet,&count);
         AcquireSRWLockExclusive(&s->lock);s->negotiating=INVALID_SOCKET;ReleaseSRWLockExclusive(&s->lock);
         if (!connected) goto close;
         AcquireSRWLockExclusive(&s->lock);
-        s->connection=fd;s->keyboard=keyboard;s->mouse=mouse;
+        s->connection=fd;s->keyboard=keyboard;s->mouse=mouse;s->gamepad=gamepad;
         WakeAllConditionVariable(&s->changed);
         ReleaseSRWLockExclusive(&s->lock);
         while (WaitForSingleObject(s->stop,0)!=WAIT_OBJECT_0) {
@@ -127,7 +139,9 @@ static DWORD WINAPI worker(void *context)
             if (packet.magic!=INPUT_MAGIC) break;
             AcquireSRWLockExclusive(&s->lock);
             asb_input_router_reply(&s->router,&packet);
-            if (packet.type==INPUT_MOUSE_REPLY && (packet.param2&0x80000000u)) {
+            if (gamepad_reply(&packet)) {
+                s->gamepad=packet.param1==INPUT_GAMEPAD_VERSION ? INPUT_GAMEPAD_VERSION : 0;
+            } else if (packet.type==INPUT_MOUSE_REPLY && (packet.param2&0x80000000u)) {
                 s->barrier_done=packet.param2;
             } else if (s->tail-s->head<ARRAYSIZE(s->replies)) {
                 s->replies[s->tail++%ARRAYSIZE(s->replies)]=packet;
@@ -136,7 +150,7 @@ static DWORD WINAPI worker(void *context)
             ReleaseSRWLockExclusive(&s->lock);
         }
         AcquireSRWLockExclusive(&s->lock);
-        s->connection=INVALID_SOCKET;s->keyboard=1;s->mouse=0;
+        s->connection=INVALID_SOCKET;s->keyboard=1;s->mouse=0;s->gamepad=0;
         asb_input_router_disconnect(&s->router);
         WakeAllConditionVariable(&s->changed);
         ReleaseSRWLockExclusive(&s->lock);
@@ -204,6 +218,7 @@ ASB_API void asb_input_status(AsbInputSession *s,AsbInputStatus *out)
     out->generation=s->router.generation;out->work_id=s->router.work_id;
     out->x=s->router.cursor_x;out->y=s->router.cursor_y;
     out->connection=s->connection;out->keyboard_version=s->keyboard;out->mouse_version=s->mouse;
+    out->gamepad_version=s->gamepad;
     ReleaseSRWLockShared(&s->lock);
 }
 
@@ -212,7 +227,19 @@ ASB_API void asb_input_viewer(AsbInputSession *s,BOOL attached)
     if (!s) return;
     AcquireSRWLockExclusive(&s->lock);
     if (attached) ++s->viewers;
-    else if (s->viewers) --s->viewers;
+    else if (s->viewers && !--s->viewers) {
+        static const AsbGamepadState detached[INPUT_GAMEPAD_SLOTS];
+        asb_input_router_gamepads(&s->router,detached,0);
+    }
+    ReleaseSRWLockExclusive(&s->lock);
+}
+
+ASB_API void asb_input_gamepads(AsbInputSession *s,const AsbGamepadState *states,UINT32 connected)
+{
+    if (!s) return;
+    AcquireSRWLockExclusive(&s->lock);
+    if (!s->retired && s->gamepad==INPUT_GAMEPAD_VERSION)
+        asb_input_router_gamepads(&s->router,states,connected);
     ReleaseSRWLockExclusive(&s->lock);
 }
 

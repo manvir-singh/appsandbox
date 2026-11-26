@@ -235,6 +235,12 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     <ResourceCompile Include="src\app_win\appsandbox.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <!-- Keep this build's helper if the post-build resource copy staged a different version. -->
+  <Target Name="StageGuestInputHelper" AfterTargets="Build"
+          Condition="Exists('$(TargetDir)appsandbox-input.exe')">
+    <Copy SourceFiles="$(TargetDir)appsandbox-input.exe" DestinationFolder="$(TargetDir)resources"
+          SkipUnchangedFiles="true" />
+  </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>

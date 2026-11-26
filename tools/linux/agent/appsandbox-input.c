@@ -319,6 +319,89 @@ static void emit(int fd, uint16_t type, uint16_t code, int32_t value)
 
 static void emit_syn(int fd) { emit(fd, EV_SYN, SYN_REPORT, 0); }
 
+/* Xbox button bits in the order defined by the XInput report. The D-pad
+ * is exposed as a hat, with independent analog trigger axes. */
+static const uint16_t gamepad_buttons[] = {
+    [4] = BTN_START, [5] = BTN_SELECT, [6] = BTN_THUMBL, [7] = BTN_THUMBR,
+    [8] = BTN_TL, [9] = BTN_TR, [10] = BTN_MODE,
+    [12] = BTN_A, [13] = BTN_B, [14] = BTN_X, [15] = BTN_Y
+};
+
+static const struct uinput_abs_setup gamepad_axes[] = {
+    { .code = ABS_X, .absinfo = { .minimum = INT16_MIN, .maximum = INT16_MAX } },
+    { .code = ABS_Y, .absinfo = { .minimum = INT16_MIN, .maximum = INT16_MAX } },
+    { .code = ABS_RX, .absinfo = { .minimum = INT16_MIN, .maximum = INT16_MAX } },
+    { .code = ABS_RY, .absinfo = { .minimum = INT16_MIN, .maximum = INT16_MAX } },
+    { .code = ABS_Z, .absinfo = { .maximum = UINT8_MAX } },
+    { .code = ABS_RZ, .absinfo = { .maximum = UINT8_MAX } },
+    { .code = ABS_HAT0X, .absinfo = { .minimum = -1, .maximum = 1 } },
+    { .code = ABS_HAT0Y, .absinfo = { .minimum = -1, .maximum = 1 } }
+};
+
+static int uinput_open_gamepad(void)
+{
+    int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return -1;
+
+    struct uinput_setup setup = { .id = { BUS_VIRTUAL, 0xA53B, 3, 1 },
+                                  .name = "AppSandbox Virtual Gamepad" };
+    if (ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0 || ioctl(fd, UI_SET_EVBIT, EV_ABS) < 0)
+        goto failed;
+    for (unsigned bit = 0; bit < sizeof(gamepad_buttons) / sizeof(gamepad_buttons[0]); ++bit) {
+        if (gamepad_buttons[bit] && ioctl(fd, UI_SET_KEYBIT, gamepad_buttons[bit]) < 0)
+            goto failed;
+    }
+    for (unsigned axis = 0; axis < sizeof(gamepad_axes) / sizeof(gamepad_axes[0]); ++axis) {
+        if (ioctl(fd, UI_ABS_SETUP, &gamepad_axes[axis]) < 0) goto failed;
+    }
+    if (ioctl(fd, UI_DEV_SETUP, &setup) == 0 && ioctl(fd, UI_DEV_CREATE) == 0)
+        return fd;
+
+failed:
+    close(fd);
+    return -1;
+}
+
+static int32_t gamepad_invert_y(int16_t y)
+{
+    return y == INT16_MIN ? INT16_MAX : -(int32_t)y;
+}
+
+static void do_gamepad(int *fd, const AsbGamepadState *state)
+{
+    const int32_t axes[] = {
+        state->left_x, gamepad_invert_y(state->left_y),
+        state->right_x, gamepad_invert_y(state->right_y),
+        state->left_trigger, state->right_trigger,
+        !!(state->buttons & 0x0008) - !!(state->buttons & 0x0004),
+        !!(state->buttons & 0x0002) - !!(state->buttons & 0x0001)
+    };
+    struct input_event events[sizeof(gamepad_buttons) / sizeof(gamepad_buttons[0]) +
+                              sizeof(gamepad_axes) / sizeof(gamepad_axes[0]) + 1];
+    unsigned count = 0;
+    for (unsigned bit = 0; bit < sizeof(gamepad_buttons) / sizeof(gamepad_buttons[0]); ++bit) {
+        if (gamepad_buttons[bit]) {
+            events[count++] = (struct input_event){ .type = EV_KEY, .code = gamepad_buttons[bit],
+                                                   .value = !!(state->buttons & (1u << bit)) };
+        }
+    }
+    for (unsigned axis = 0; axis < sizeof(axes) / sizeof(axes[0]); ++axis) {
+        events[count++] = (struct input_event){ .type = EV_ABS, .code = gamepad_axes[axis].code,
+                                               .value = axes[axis] };
+    }
+    events[count++] = (struct input_event){ .type = EV_SYN, .code = SYN_REPORT };
+
+    size_t bytes = count * sizeof(events[0]);
+    ssize_t written;
+    do {
+        written = write(*fd, events, bytes);
+    } while (written < 0 && errno == EINTR);
+    if (written != (ssize_t)bytes) {
+        uinput_close(*fd);
+        *fd = -1;
+    }
+}
+
 /* ---- Event translation ---- */
 
 static void do_mouse_move(int ui_fd, uint32_t x, uint32_t y,
@@ -522,6 +605,9 @@ static void serve(int client_fd, int ui_fd)
 
     uint32_t keyboard_version = 1;
     uint32_t mouse_version = 0;
+    uint32_t gamepad_version = 0;
+    int gamepads[INPUT_GAMEPAD_SLOTS];
+    for (unsigned slot = 0; slot < INPUT_GAMEPAD_SLOTS; ++slot) gamepads[slot] = -1;
     int relative_fd = -1;
     int after_relative = 0;
     uint8_t held[KEY_CNT] = {0};
@@ -531,6 +617,16 @@ static void serve(int client_fd, int ui_fd)
         if (pkt.magic != INPUT_MAGIC) {
             in_log("bad magic 0x%08x — desync, closing", pkt.magic);
             break;
+        }
+        if (pkt.type >= INPUT_GAMEPAD_STATE && pkt.type < INPUT_GAMEPAD_STATE + INPUT_GAMEPAD_SLOTS) {
+            if (!gamepad_version) continue;
+            int *fd = &gamepads[pkt.type - INPUT_GAMEPAD_STATE];
+            if (*fd < 0) *fd = uinput_open_gamepad();
+            if (*fd >= 0) {
+                AsbGamepadState state = asb_gamepad_state(&pkt);
+                do_gamepad(fd, &state);
+            }
+            continue;
         }
         switch (pkt.type) {
         case INPUT_MOUSE_MOVE:
@@ -594,12 +690,34 @@ static void serve(int client_fd, int ui_fd)
             if (keyboard_version >= INPUT_KEYBOARD_VERSION)
                 do_physical_key(ui_fd, pkt.param1, pkt.param2, pkt.param3, held);
             break;
+        case INPUT_GAMEPAD_QUERY: {
+            if (pkt.param2 || pkt.param3) break;
+            uint32_t version = pkt.param1 >= INPUT_GAMEPAD_VERSION ? INPUT_GAMEPAD_VERSION : 0;
+            InputPacket reply = { INPUT_MAGIC, INPUT_GAMEPAD_REPLY, version, 0, 0 };
+            if (send_exact(client_fd, &reply, sizeof(reply)) < 0) goto disconnected;
+            gamepad_version = version;
+            break;
+        }
+        case INPUT_GAMEPAD_DISCONNECT:
+            if (gamepad_version && pkt.param1 < INPUT_GAMEPAD_SLOTS && !pkt.param2 && !pkt.param3) {
+                uinput_close(gamepads[pkt.param1]);
+                gamepads[pkt.param1] = -1;
+            }
+            break;
+        case INPUT_GAMEPAD_RESET:
+            if (gamepad_version && !pkt.param1 && !pkt.param2 && !pkt.param3) {
+                static const AsbGamepadState neutral;
+                for (unsigned slot = 0; slot < INPUT_GAMEPAD_SLOTS; ++slot)
+                    if (gamepads[slot] >= 0) do_gamepad(&gamepads[slot], &neutral);
+            }
+            break;
         default: break;
         }
     }
 disconnected:
     release_physical_keys(ui_fd, held);
     uinput_close(relative_fd);
+    for (unsigned slot = 0; slot < INPUT_GAMEPAD_SLOTS; ++slot) uinput_close(gamepads[slot]);
 }
 
 int main(void)

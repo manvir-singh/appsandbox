@@ -13,6 +13,7 @@ typedef struct {
 typedef struct AsbInputSession AsbInputSession;
 typedef struct {
     UINT32 flags,generation,work_id,x,y,keyboard_version,mouse_version;
+    UINT32 gamepad_version;
     SOCKET connection;
     wchar_t identity[161],vendor[161],model[161],purpose[601];
 } AsbInputStatus;
@@ -24,6 +25,7 @@ typedef struct {
 ASB_API AsbInputSession *asb_input_session(const AsbHeadlessTarget *target);
 ASB_API void asb_input_release(AsbInputSession *session);
 ASB_API void asb_input_viewer(AsbInputSession *session,BOOL attached);
+ASB_API void asb_input_gamepads(AsbInputSession *session,const AsbGamepadState *states,UINT32 connected);
 ASB_API void asb_input_status(AsbInputSession *session,AsbInputStatus *status);
 ASB_API DWORD asb_input_claim(AsbInputSession *session,const AsbInputStatus *context);
 ASB_API DWORD asb_input_control(AsbInputSession *session,UINT32 command,UINT32 work_id);

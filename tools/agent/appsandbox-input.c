@@ -12,6 +12,7 @@
 
 #include "../transport/asb_transport.h"
 #include "../../src/core/protocol.h"
+#include "guest_gamepad.h"
 #include <windows.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -259,20 +260,6 @@ static void release_physical_keys(PhysicalKeyState *keys)
     }
 }
 
-/* ---- Receive exactly len bytes (transport may deliver partial reads) ---- */
-
-static int recv_full(AsbConn *c, void *buf, int len)
-{
-    int got = 0;
-    while (got < len) {
-        int n = asb_recv(c, (char *)buf + got, len - got);
-        if (n <= 0)
-            return n;   /* 0 = peer closed, <0 = error */
-        got += n;
-    }
-    return got;
-}
-
 static int send_full(AsbConn *c, const void *buf, int len)
 {
     int sent = 0;
@@ -285,6 +272,16 @@ static int send_full(AsbConn *c, const void *buf, int len)
     return sent;
 }
 
+static BOOL disable_gamepads(AsbConn *c, AsbGuestGamepads *gamepads, UINT *version)
+{
+    input_log("ViGEmBus gamepad operation failed (%lu). Controller forwarding disabled for this connection.",
+              GetLastError());
+    asb_guest_gamepads_close(gamepads);
+    *version = 0;
+    InputPacket reply = { INPUT_MAGIC, INPUT_GAMEPAD_REPLY, 0, 0, 0 };
+    return send_full(c, &reply, (int)sizeof(reply)) == (int)sizeof(reply);
+}
+
 /* ---- Handle one host connection ---- */
 
 static void handle_conn(AsbConn *c)
@@ -293,8 +290,11 @@ static void handle_conn(AsbConn *c)
     PhysicalKeyState keys = {0};
     UINT keyboard_version = 1;
     UINT mouse_version = 0;
+    UINT gamepad_version = 0;
+    AsbGuestGamepads gamepads = {0};
     UINT pkt_count = 0;
     UINT32 ready = INPUT_READY_MAGIC;
+    int received = 0;
 
     /* Tell the host we're ready to receive input. */
     if (asb_send(c, &ready, sizeof(ready)) != (int)sizeof(ready)) {
@@ -304,12 +304,29 @@ static void handle_conn(AsbConn *c)
     input_log("Sent ready signal to host. Entering recv loop.");
 
     for (;;) {
-        int n = recv_full(c, &pkt, (int)sizeof(pkt));
+        /* Wake for deferred gamepad reports even if the host sends no further
+         * input. Preserve partial packets across those wakeups. */
+        if (gamepads.pending) {
+            if (!asb_guest_gamepads_retry(&gamepads) && !disable_gamepads(c, &gamepads, &gamepad_version))
+                break;
+            if (gamepads.pending) {
+                int available = asb_poll(c, ASB_GAMEPAD_RETRY_MS);
+                if (available < 0) {
+                    input_log("Input connection closed while retrying gamepad reports after %u packets.", pkt_count);
+                    break;
+                }
+                if (available == 0) continue;
+            }
+        }
+        int n = asb_recv(c, (char *)&pkt + received, (int)sizeof(pkt) - received);
         if (n <= 0) {
             input_log("%s after %u packets.",
                        n == 0 ? "Host disconnected" : "recv error", pkt_count);
             break;
         }
+        received += n;
+        if (received != (int)sizeof(pkt)) continue;
+        received = 0;
         if (pkt.magic != INPUT_MAGIC) {
             input_log("Bad magic 0x%08X, skipping.", pkt.magic);
             continue;
@@ -360,11 +377,25 @@ static void handle_conn(AsbConn *c)
                 inject_physical_key(&pkt, &keys);
         } else if (pkt.type == INPUT_UNICODE) {
             inject_unicode(&pkt);
+        } else if (pkt.type == INPUT_GAMEPAD_QUERY) {
+            if (pkt.param2 || pkt.param3) continue;
+            if (pkt.param1 >= INPUT_GAMEPAD_VERSION && asb_guest_gamepads_open(&gamepads)) {
+                gamepad_version = INPUT_GAMEPAD_VERSION;
+            } else {
+                asb_guest_gamepads_close(&gamepads);
+                gamepad_version = 0;
+            }
+            InputPacket reply = { INPUT_MAGIC, INPUT_GAMEPAD_REPLY, gamepad_version, 0, 0 };
+            if (send_full(c, &reply, (int)sizeof(reply)) != (int)sizeof(reply)) break;
+        } else if (pkt.type >= INPUT_GAMEPAD_STATE && pkt.type <= INPUT_GAMEPAD_RESET) {
+            if (gamepad_version && !asb_guest_gamepads_receive(&gamepads, &pkt) &&
+                !disable_gamepads(c, &gamepads, &gamepad_version)) break;
         } else {
             inject_input(&pkt, mouse_version);
         }
     }
     release_physical_keys(&keys);
+    asb_guest_gamepads_close(&gamepads);
 }
 
 /* ---- Main: listen on the input channel, accept connections ---- */

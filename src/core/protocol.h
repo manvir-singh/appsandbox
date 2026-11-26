@@ -19,6 +19,13 @@
 #define INPUT_MOUSE_POSITION_QUERY 10
 #define INPUT_MOUSE_POSITION_REPLY 11
 #define INPUT_UNICODE          12
+#define INPUT_GAMEPAD_QUERY    32
+#define INPUT_GAMEPAD_REPLY    33
+#define INPUT_GAMEPAD_STATE    34 /* Add a slot index, 0 through 3. */
+#define INPUT_GAMEPAD_DISCONNECT 38
+#define INPUT_GAMEPAD_RESET    39
+#define INPUT_GAMEPAD_VERSION  1
+#define INPUT_GAMEPAD_SLOTS    4
 #define INPUT_MOUSE_VERSION   1
 #define INPUT_MOUSE_NORMALIZED_VERSION 2
 #define INPUT_MOUSE_NORMALIZED 1u
@@ -42,6 +49,11 @@
  * POSITION_QUERY: param1 = request ID, param2/param3 = 0.
  * POSITION_REPLY: param1/param2 = physical guest-screen X/Y, param3 = request ID.
  * Both coordinates are INT32_MIN if the cursor position cannot be read.
+ * GAMEPAD_QUERY/REPLY: param1 = gamepad version (0 if unavailable), param2/param3 = 0.
+ * GAMEPAD_STATE: Xbox button bits and two byte triggers in param1, signed
+ * left X/Y in param2 and right X/Y in param3 (low/high 16 bits).
+ * GAMEPAD_DISCONNECT: param1 = slot, param2/param3 = 0.
+ * GAMEPAD_RESET: neutralize all connected pads, all parameters zero.
  */
 #pragma pack(push, 1)
 typedef struct {
@@ -51,7 +63,31 @@ typedef struct {
     uint32_t param2;
     uint32_t param3;
 } InputPacket;
+
+typedef struct {
+    uint16_t buttons;
+    uint8_t left_trigger, right_trigger;
+    int16_t left_x, left_y, right_x, right_y;
+} AsbGamepadState;
 #pragma pack(pop)
+
+static inline InputPacket asb_gamepad_packet(unsigned slot, const AsbGamepadState *state)
+{
+    InputPacket packet = { INPUT_MAGIC, INPUT_GAMEPAD_STATE + slot,
+        state->buttons | ((uint32_t)state->left_trigger << 16) | ((uint32_t)state->right_trigger << 24),
+        (uint16_t)state->left_x | ((uint32_t)(uint16_t)state->left_y << 16),
+        (uint16_t)state->right_x | ((uint32_t)(uint16_t)state->right_y << 16) };
+    return packet;
+}
+
+static inline AsbGamepadState asb_gamepad_state(const InputPacket *packet)
+{
+    AsbGamepadState state = { (uint16_t)packet->param1,
+        (uint8_t)(packet->param1 >> 16), (uint8_t)(packet->param1 >> 24),
+        (int16_t)packet->param2, (int16_t)(packet->param2 >> 16),
+        (int16_t)packet->param3, (int16_t)(packet->param3 >> 16) };
+    return state;
+}
 
 #define DISPLAY_GPU_MAGIC     0x50475341u
 #define DISPLAY_GPU_VERSION   3

@@ -9,6 +9,8 @@ typedef struct {
     uint32_t generation,work_id,cancelled_work,owner,working,paused,cancelled;
     uint32_t cursor_x,cursor_y,buttons,transition,transition_id,sequence;
     uint8_t scan[2][256],vk[2][256],legacy[256];
+    uint32_t gamepads;
+    AsbGamepadState gamepad_state[INPUT_GAMEPAD_SLOTS];
     AsbInputEmit emit;
     void *context;
 } AsbInputRouter;
@@ -16,6 +18,8 @@ void asb_input_router_init(AsbInputRouter *router,AsbInputEmit emit,void *contex
 uint32_t asb_input_router_request(AsbInputRouter *router,uint32_t work);
 uint32_t asb_input_router_control(AsbInputRouter *router,uint32_t command,uint32_t work);
 uint32_t asb_input_router_send(AsbInputRouter *router,int agent,uint32_t generation,const InputPacket *packet);
+/* Pass NULL to neutralize attached pads, or a zero mask to detach all pads. */
+void asb_input_router_gamepads(AsbInputRouter *router,const AsbGamepadState *states,uint32_t connected);
 void asb_input_router_observe(AsbInputRouter *router,int agent,const InputPacket *packet);
 void asb_input_router_reply(AsbInputRouter *router,const InputPacket *packet);
 void asb_input_router_disconnect(AsbInputRouter *router);

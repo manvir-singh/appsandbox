@@ -12,6 +12,38 @@ static int emit(AsbInputRouter *r,uint32_t type,uint32_t a,uint32_t b,uint32_t c
     return r->emit && r->emit(r->context,&packet);
 }
 
+static int neutralize_gamepads(AsbInputRouter *r)
+{
+    static const AsbGamepadState neutral[INPUT_GAMEPAD_SLOTS];
+    if (!memcmp(r->gamepad_state,neutral,sizeof(neutral))) return 1;
+    if (!emit(r,INPUT_GAMEPAD_RESET,0,0,0)) return 0;
+    memset(r->gamepad_state,0,sizeof(r->gamepad_state));
+    return 1;
+}
+
+void asb_input_router_gamepads(AsbInputRouter *r,const AsbGamepadState *states,uint32_t connected)
+{
+    if (!states) {
+        neutralize_gamepads(r);
+        return;
+    }
+    if (connected && (r->transition || r->owner==ASB_CONTROL_AGENT)) return;
+    for (unsigned slot=0;slot<INPUT_GAMEPAD_SLOTS;++slot) {
+        uint32_t bit=1u<<slot;
+        if (!(connected&bit)) {
+            if (!(r->gamepads&bit)) continue;
+            if (!emit(r,INPUT_GAMEPAD_DISCONNECT,slot,0,0)) return;
+            r->gamepads&=~bit;
+            memset(&r->gamepad_state[slot],0,sizeof(r->gamepad_state[slot]));
+        } else if (!(r->gamepads&bit) || memcmp(&states[slot],&r->gamepad_state[slot],sizeof(states[slot]))) {
+            InputPacket packet=asb_gamepad_packet(slot,&states[slot]);
+            if (!emit(r,packet.type,packet.param1,packet.param2,packet.param3)) return;
+            r->gamepads|=bit;
+            r->gamepad_state[slot]=states[slot];
+        }
+    }
+}
+
 static int release(AsbInputRouter *r)
 {
     int ok=1;
@@ -27,7 +59,7 @@ static int release(AsbInputRouter *r)
     memset(r->vk,0,sizeof(r->vk));
     memset(r->legacy,0,sizeof(r->legacy));
     r->buttons=0;
-    return ok;
+    return neutralize_gamepads(r) && ok;
 }
 
 static uint32_t transfer(AsbInputRouter *r,uint32_t owner)
@@ -134,6 +166,8 @@ void asb_input_router_disconnect(AsbInputRouter *r)
     memset(r->scan,0,sizeof(r->scan));
     memset(r->vk,0,sizeof(r->vk));
     memset(r->legacy,0,sizeof(r->legacy));
+    memset(r->gamepad_state,0,sizeof(r->gamepad_state));
+    r->gamepads=0;
     r->buttons=r->transition=0;
     r->owner=ASB_CONTROL_USER;
     if (r->working) r->paused=1;

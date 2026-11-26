@@ -648,30 +648,106 @@ static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT3
     ReleaseSRWLockExclusive(&d->input_lock);
 }
 
+#define GAMEPAD_ATTACH_DELAY_MS  64
+#define GAMEPAD_DETACH_DELAY_MS  1000
+#define GAMEPAD_RECHECK_MS       64
+#define GAMEPAD_EMPTY_PROBE_MS   1000
+#define GAMEPAD_SAMPLE_MAX_AGE_MS 150
+
+static SRWLOCK g_gamepad_lock = SRWLOCK_INIT;
+static BOOL g_gamepad_poll_pending;
+static ULONGLONG g_gamepad_sample_at;
+static UINT32 g_gamepad_connected;
+static AsbGamepadState g_gamepad_states[INPUT_GAMEPAD_SLOTS];
+
+static VOID CALLBACK idd_sample_gamepads(PTP_CALLBACK_INSTANCE instance, PVOID context)
+{
+    (void)instance;
+    (void)context;
+    /* Only one callback samples at a time. This state is shared across viewers
+       so switching guests cannot start a second XInput poll. */
+    static struct {
+        BOOL connected;
+        ULONGLONG next_probe, change_at;
+    } slots[INPUT_GAMEPAD_SLOTS];
+    ULONGLONG started = GetTickCount64();
+    AsbGamepadState states[INPUT_GAMEPAD_SLOTS] = {0};
+    UINT32 connected = 0;
+
+    for (DWORD slot = 0; slot < INPUT_GAMEPAD_SLOTS; ++slot) {
+        ULONGLONG now = GetTickCount64();
+        if (now >= slots[slot].next_probe) {
+            XINPUT_STATE state;
+            /* Native and Steam Input Gamepad layouts both report through XInput. */
+            DWORD result = XInputGetState(slot, &state);
+            BOOL present = result == ERROR_SUCCESS;
+            now = GetTickCount64();
+            if (present == slots[slot].connected || (!present && result != ERROR_DEVICE_NOT_CONNECTED)) {
+                slots[slot].change_at = 0;
+            } else if (!slots[slot].change_at) {
+                slots[slot].change_at = now + (present ? GAMEPAD_ATTACH_DELAY_MS : GAMEPAD_DETACH_DELAY_MS);
+            } else if (now >= slots[slot].change_at) {
+                slots[slot].connected = present;
+                slots[slot].change_at = 0;
+            }
+
+            if (!present) {
+                slots[slot].next_probe = now + (slots[slot].connected ? GAMEPAD_RECHECK_MS : GAMEPAD_EMPTY_PROBE_MS);
+            } else if (slots[slot].connected) {
+                const XINPUT_GAMEPAD *pad = &state.Gamepad;
+                states[slot] = (AsbGamepadState){ pad->wButtons, pad->bLeftTrigger, pad->bRightTrigger,
+                    pad->sThumbLX, pad->sThumbLY, pad->sThumbRX, pad->sThumbRY };
+            }
+        }
+        if (slots[slot].connected) connected |= 1u << slot;
+    }
+
+    AcquireSRWLockExclusive(&g_gamepad_lock);
+    memcpy(g_gamepad_states, states, sizeof(states));
+    g_gamepad_connected = connected;
+    g_gamepad_sample_at = started;
+    g_gamepad_poll_pending = FALSE;
+    ReleaseSRWLockExclusive(&g_gamepad_lock);
+}
+
+static BOOL idd_gamepad_snapshot(AsbGamepadState *states, UINT32 *connected)
+{
+    AcquireSRWLockExclusive(&g_gamepad_lock);
+    BOOL schedule = !g_gamepad_poll_pending;
+    g_gamepad_poll_pending = TRUE;
+    BOOL fresh = g_gamepad_sample_at && GetTickCount64() - g_gamepad_sample_at <= GAMEPAD_SAMPLE_MAX_AGE_MS;
+    if (fresh) {
+        memcpy(states, g_gamepad_states, sizeof(g_gamepad_states));
+        *connected = g_gamepad_connected;
+    }
+    ReleaseSRWLockExclusive(&g_gamepad_lock);
+
+    /* XInput can block during device enumeration. The callback has no viewer
+       reference, so a stalled driver cannot hold up rendering or window teardown. */
+    if (schedule && !TrySubmitThreadpoolCallback(idd_sample_gamepads, NULL, NULL)) {
+        AcquireSRWLockExclusive(&g_gamepad_lock);
+        g_gamepad_poll_pending = FALSE;
+        ReleaseSRWLockExclusive(&g_gamepad_lock);
+    }
+    return fresh;
+}
+
 static void idd_poll_gamepads(VmDisplayIdd *d)
 {
     if (!d->gamepad_supported) return;
 
     AsbGamepadState states[INPUT_GAMEPAD_SLOTS] = {0};
     UINT32 connected = 0;
+    const AsbGamepadState *forward = NULL;
     BOOL active = !d->stop && d->frame_connected && d->input_focused &&
                   !d->input_menu_active && !d->input_sizing && !IsIconic(d->hwnd) &&
                   GetForegroundWindow() == d->hwnd && d->agent_control != ASB_CONTROL_AGENT;
 
-    /* Steam Input's Gamepad layout exposes Xbox-compatible state through XInput. */
-    if (active && !d->gamepads_disabled) {
-        for (DWORD slot = 0; slot < INPUT_GAMEPAD_SLOTS; ++slot) {
-            XINPUT_STATE state;
-            if (XInputGetState(slot, &state) != ERROR_SUCCESS) continue;
-            const XINPUT_GAMEPAD *pad = &state.Gamepad;
-            states[slot] = (AsbGamepadState){ pad->wButtons, pad->bLeftTrigger, pad->bRightTrigger,
-                pad->sThumbLX, pad->sThumbLY, pad->sThumbRX, pad->sThumbRY };
-            connected |= 1u << slot;
-        }
-    }
+    if (d->gamepads_disabled || (active && idd_gamepad_snapshot(states, &connected)))
+        forward = states;
 
     AcquireSRWLockShared(&d->input_lock);
-    asb_input_gamepads(d->input, (active || d->gamepads_disabled) ? states : NULL, connected);
+    asb_input_gamepads(d->input, forward, connected);
     ReleaseSRWLockShared(&d->input_lock);
 }
 

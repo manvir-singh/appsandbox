@@ -7,6 +7,9 @@
 #include <wincrypt.h>
 #include <bcrypt.h>
 #include <imapi2fs.h>
+#include <cfgmgr32.h>
+#include <wbemidl.h>
+#include <winioctl.h>
 
 #pragma comment(lib, "virtdisk.lib")
 #pragma comment(lib, "crypt32.lib")
@@ -14,6 +17,8 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "urlmon.lib")
+#pragma comment(lib, "cfgmgr32.lib")
+#pragma comment(lib, "wbemuuid.lib")
 
 #include <urlmon.h>
 
@@ -37,6 +42,323 @@ static const GUID VHDX_VENDOR_MS = {
     0xec984aec, 0xa0f9, 0x47e9,
     { 0x90, 0x1f, 0x71, 0x41, 0x5a, 0x66, 0x34, 0x5b }
 };
+
+static BOOL disk_property(IWbemClassObject *object, const wchar_t *key,
+                          VARTYPE type, VARIANT *value)
+{
+    VariantInit(value);
+    if (SUCCEEDED(object->lpVtbl->Get(object, key, 0, value, NULL, NULL)) &&
+        SUCCEEDED(VariantChangeType(value, value, 0, type))) return TRUE;
+    VariantClear(value);
+    return FALSE;
+}
+
+static BOOL disk_string(IWbemClassObject *object, const wchar_t *key,
+                        wchar_t *out, size_t capacity)
+{
+    VARIANT value;
+    if (!disk_property(object, key, VT_BSTR, &value)) return FALSE;
+    const wchar_t *str = value.bstrVal;
+    BOOL valid = str && *str && SysStringLen(value.bstrVal) == wcslen(str) &&
+                 wcslen(str) < capacity && !wcspbrk(str, L"\r\n");
+    if (valid) wcscpy_s(out, capacity, str);
+    VariantClear(&value);
+    return valid;
+}
+
+static BOOL disk_flag_set(IWbemClassObject *object, const wchar_t *key)
+{
+    VARIANT value;
+    if (!disk_property(object, key, VT_BOOL, &value)) return FALSE;
+    BOOL set = value.boolVal != VARIANT_FALSE;
+    VariantClear(&value);
+    return set;
+}
+
+static ULONGLONG disk_uint(IWbemClassObject *object, const wchar_t *key, ULONGLONG fallback)
+{
+    VARIANT value;
+    if (!disk_property(object, key, VT_UI8, &value)) return fallback;
+    ULONGLONG result = value.ullVal;
+    VariantClear(&value);
+    return result;
+}
+
+static BOOL unsupported_disk_bus(ULONGLONG bus)
+{
+    return bus == BusTypeVirtual || bus == BusTypeFileBackedVirtual ||
+           bus == BusTypeSpaces || bus == BusTypeiScsi;
+}
+
+/* The storage provider adds display names, legacy IDs and protection flags.
+   Discovery and the offline check are done through the device interfaces. */
+static void load_disk_metadata(PhysicalDisk *disks, size_t disk_count)
+{
+    IWbemLocator *locator = NULL;
+    IWbemServices *service = NULL;
+    IEnumWbemClassObject *rows = NULL;
+    BSTR storage = NULL, disk_class = NULL;
+    HRESULT com = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(com) && com != RPC_E_CHANGED_MODE) return;
+
+    storage = SysAllocString(L"ROOT\\Microsoft\\Windows\\Storage");
+    disk_class = SysAllocString(L"MSFT_Disk");
+    if (!storage || !disk_class) goto done;
+    HRESULT hr = CoCreateInstance(&CLSID_WbemLocator, NULL, CLSCTX_INPROC_SERVER,
+                                  &IID_IWbemLocator, (void **)&locator);
+    if (FAILED(hr)) goto done;
+    hr = locator->lpVtbl->ConnectServer(locator, storage, NULL, NULL, NULL,
+                                         WBEM_FLAG_CONNECT_USE_MAX_WAIT, NULL, NULL, &service);
+    if (FAILED(hr)) goto done;
+    hr = CoSetProxyBlanket((IUnknown *)service, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL,
+                          RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE);
+    if (FAILED(hr)) goto done;
+    hr = service->lpVtbl->CreateInstanceEnum(service, disk_class,
+        WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, NULL, &rows);
+    if (FAILED(hr)) goto done;
+
+    for (;;) {
+        IWbemClassObject *row = NULL;
+        ULONG count = 0;
+        hr = rows->lpVtbl->Next(rows, 5000, 1, &row, &count);
+        if (FAILED(hr) || !count) break;
+        ULONGLONG number = disk_uint(row, L"Number", MAXDWORD);
+        for (size_t i = 0; i < disk_count; i++) {
+            PhysicalDisk *disk = &disks[i];
+            if (number != disk->number) continue;
+            if (unsupported_disk_bus(disk_uint(row, L"BusType", BusTypeUnknown)) ||
+                disk_flag_set(row, L"IsBoot") || disk_flag_set(row, L"IsSystem") ||
+                disk_flag_set(row, L"IsClustered")) {
+                disk->path[0] = L'\0';
+                continue;
+            }
+            if (!disk->size_bytes) disk->size_bytes = disk_uint(row, L"Size", 0);
+            disk_string(row, L"FriendlyName", disk->name, ARRAYSIZE(disk->name));
+            wchar_t path[MAX_PATH];
+            if (disk_string(row, L"Path", path, ARRAYSIZE(path)) && _wcsicmp(path, disk->path) == 0)
+                disk_string(row, L"UniqueId", disk->legacy_id, ARRAYSIZE(disk->legacy_id));
+        }
+        row->lpVtbl->Release(row);
+    }
+done:
+    if (rows) rows->lpVtbl->Release(rows);
+    if (service) service->lpVtbl->Release(service);
+    if (locator) locator->lpVtbl->Release(locator);
+    SysFreeString(disk_class);
+    SysFreeString(storage);
+    if (SUCCEEDED(com)) CoUninitialize();
+}
+
+static HRESULT list_disk_interfaces(wchar_t **paths)
+{
+    /* GUID_DEVINTERFACE_DISK */
+    GUID disk_interface = { 0x53f56307, 0xb6bf, 0x11d0, { 0x94, 0xf2, 0x00, 0xa0, 0xc9, 0x1e, 0xfb, 0x8b } };
+    for (int attempt = 0; attempt < 3; attempt++) {
+        ULONG capacity = 0;
+        CONFIGRET cr = CM_Get_Device_Interface_List_SizeW(&capacity, &disk_interface, NULL,
+                                                          CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
+        if (cr != CR_SUCCESS) return HRESULT_FROM_WIN32(CM_MapCrToWin32Err(cr, ERROR_GEN_FAILURE));
+        if (!capacity) return S_FALSE;
+        wchar_t *buffer = calloc(capacity, sizeof(*buffer));
+        if (!buffer) return E_OUTOFMEMORY;
+        cr = CM_Get_Device_Interface_ListW(&disk_interface, NULL, buffer, capacity,
+                                          CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
+        if (cr == CR_SUCCESS) {
+            *paths = buffer;
+            return S_OK;
+        }
+        free(buffer);
+        if (cr != CR_BUFFER_SMALL) return HRESULT_FROM_WIN32(CM_MapCrToWin32Err(cr, ERROR_GEN_FAILURE));
+    }
+    return HRESULT_FROM_WIN32(ERROR_RETRY);
+}
+
+static HRESULT get_offline_disk_number(HANDLE device, DWORD *disk_number, BOOL *read_only)
+{
+    STORAGE_DEVICE_NUMBER number;
+    DWORD bytes;
+    if (!DeviceIoControl(device, IOCTL_STORAGE_GET_DEVICE_NUMBER, NULL, 0,
+                         &number, sizeof(number), &bytes, NULL)) return HRESULT_FROM_WIN32(GetLastError());
+    if (bytes < sizeof(number) || number.DeviceType != FILE_DEVICE_DISK || number.DeviceNumber == MAXDWORD)
+        return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    *disk_number = number.DeviceNumber;
+
+    GET_DISK_ATTRIBUTES attrs = {0};
+    if (!DeviceIoControl(device, IOCTL_DISK_GET_DISK_ATTRIBUTES, NULL, 0,
+                         &attrs, sizeof(attrs), &bytes, NULL)) return HRESULT_FROM_WIN32(GetLastError());
+    if (bytes < sizeof(attrs)) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    if (!(attrs.Attributes & DISK_ATTRIBUTE_OFFLINE)) return S_FALSE;
+    *read_only = (attrs.Attributes & DISK_ATTRIBUTE_READ_ONLY) != 0;
+    return S_OK;
+}
+
+static BOOL get_disk_hardware_id(HANDLE device, DWORD number, wchar_t id[MAX_PATH])
+{
+    STORAGE_DEVICE_NUMBER_EX identity;
+    const GUID empty_guid = {0};
+    DWORD bytes;
+    if (!DeviceIoControl(device, IOCTL_STORAGE_GET_DEVICE_NUMBER_EX, NULL, 0,
+                         &identity, sizeof(identity), &bytes, NULL) ||
+        bytes < sizeof(identity) || identity.DeviceNumber != number ||
+        (identity.Flags & (STORAGE_DEVICE_FLAGS_RANDOM_DEVICEGUID_REASON_CONFLICT |
+                           STORAGE_DEVICE_FLAGS_RANDOM_DEVICEGUID_REASON_NOHWID)) ||
+        memcmp(&identity.DeviceGuid, &empty_guid, sizeof(empty_guid)) == 0) return FALSE;
+
+    /* Random device GUIDs cannot be used to find the disk after a reboot. */
+    wchar_t guid[39];
+    if (!StringFromGUID2(&identity.DeviceGuid, guid, ARRAYSIZE(guid))) return FALSE;
+    return swprintf_s(id, MAX_PATH, L"device:%s", guid) > 0;
+}
+
+static BOOL read_offline_disk(HANDLE device, const wchar_t *path, PhysicalDisk *disk)
+{
+    DWORD bytes;
+    STORAGE_PROPERTY_QUERY query = {0};
+    union {
+        STORAGE_DEVICE_DESCRIPTOR descriptor;
+        BYTE buffer[4096];
+    } info;
+    query.PropertyId = StorageDeviceProperty;
+    query.QueryType = PropertyStandardQuery;
+    if (DeviceIoControl(device, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query),
+                        &info, sizeof(info), &bytes, NULL) &&
+        bytes >= FIELD_OFFSET(STORAGE_DEVICE_DESCRIPTOR, RawDeviceProperties)) {
+        if (unsupported_disk_bus(info.descriptor.BusType)) return FALSE;
+        DWORD offset = info.descriptor.ProductIdOffset;
+        if (offset && offset < bytes && memchr(info.buffer + offset, '\0', bytes - offset) &&
+            !MultiByteToWideChar(CP_ACP, 0, (const char *)info.buffer + offset, -1,
+                                  disk->name, ARRAYSIZE(disk->name))) disk->name[0] = L'\0';
+    }
+
+    DISK_GEOMETRY_EX geometry;
+    if (DeviceIoControl(device, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, NULL, 0,
+                        &geometry, sizeof(geometry), &bytes, NULL) &&
+        bytes >= FIELD_OFFSET(DISK_GEOMETRY_EX, Data) && geometry.DiskSize.QuadPart > 0)
+        disk->size_bytes = (ULONGLONG)geometry.DiskSize.QuadPart;
+
+    get_disk_hardware_id(device, disk->number, disk->id);
+    wcscpy_s(disk->path, ARRAYSIZE(disk->path), path);
+    return TRUE;
+}
+
+HRESULT physical_disk_enum(const wchar_t *id, PhysicalDiskVisitor visit, void *context)
+{
+    wchar_t *paths = NULL;
+    HRESULT hr = list_disk_interfaces(&paths);
+    if (hr != S_OK) return FAILED(hr) || !id ? hr : HRESULT_FROM_WIN32(ERROR_NOT_READY);
+
+    size_t capacity = 0;
+    for (const wchar_t *path = paths; *path; path += wcslen(path) + 1) capacity++;
+    PhysicalDisk *disks = capacity ? calloc(capacity, sizeof(*disks)) : NULL;
+    if (capacity && !disks) {
+        free(paths);
+        return E_OUTOFMEMORY;
+    }
+    size_t count = 0;
+    for (const wchar_t *path = paths; *path; path += wcslen(path) + 1) {
+        if (wcslen(path) >= MAX_PATH) continue;
+        HANDLE device = CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    NULL, OPEN_EXISTING, 0, NULL);
+        if (device == INVALID_HANDLE_VALUE) continue;
+        PhysicalDisk disk = {0};
+        disk.number = MAXDWORD;
+        HRESULT status = get_offline_disk_number(device, &disk.number, &disk.read_only);
+        if (status == S_OK && read_offline_disk(device, path, &disk)) disks[count++] = disk;
+        else if (!id && FAILED(status) && disk.number != MAXDWORD)
+            ui_log(L"Disk %lu is unavailable for passthrough (0x%08X).", disk.number, status);
+        CloseHandle(device);
+    }
+    free(paths);
+
+    if (count) load_disk_metadata(disks, count);
+    PhysicalDisk *selected = NULL;
+    for (size_t i = 0; i < count; i++) {
+        PhysicalDisk *disk = &disks[i];
+        if (!disk->path[0]) continue;
+        if (!disk->id[0]) wcscpy_s(disk->id, ARRAYSIZE(disk->id), disk->legacy_id);
+        if (!disk->id[0] || !disk->size_bytes) {
+            if (!id) ui_log(L"Disk %lu is offline, but Windows did not report %s.", disk->number,
+                            disk->id[0] ? L"its capacity" : L"a persistent device ID");
+            continue;
+        }
+        if (!id) visit(disk, context);
+        else if (_wcsicmp(id, disk->id) == 0 || _wcsicmp(id, disk->legacy_id) == 0) {
+            if (selected) {
+                hr = HRESULT_FROM_WIN32(ERROR_DUP_NAME);
+                break;
+            }
+            selected = disk;
+        }
+    }
+    if (id && SUCCEEDED(hr)) {
+        if (selected) visit(selected, context);
+        else hr = HRESULT_FROM_WIN32(ERROR_NOT_READY);
+    }
+    free(disks);
+    return hr;
+}
+
+static void copy_physical_disk(const PhysicalDisk *disk, void *context)
+{
+    *(PhysicalDisk *)context = *disk;
+}
+
+static HRESULT check_offline_disk(HANDLE device, const PhysicalDisk *disk, BOOL *read_only)
+{
+    DWORD number = MAXDWORD;
+    HRESULT hr = get_offline_disk_number(device, &number, read_only);
+    if (FAILED(hr)) return hr;
+    if (hr != S_OK || number != disk->number) return HRESULT_FROM_WIN32(ERROR_NOT_READY);
+
+    if (wcsncmp(disk->id, L"device:", 7) == 0) {
+        wchar_t current_id[MAX_PATH];
+        if (!get_disk_hardware_id(device, number, current_id) || _wcsicmp(current_id, disk->id) != 0)
+            return HRESULT_FROM_WIN32(ERROR_NOT_READY);
+    }
+    return S_OK;
+}
+
+HRESULT physical_disk_resolve(const wchar_t *id, PhysicalDisk *disk)
+{
+    if (!id || !*id || !disk) return E_INVALIDARG;
+    HRESULT hr = physical_disk_enum(id, copy_physical_disk, disk);
+    if (FAILED(hr)) return hr;
+
+    HANDLE device = CreateFileW(disk->path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                NULL, OPEN_EXISTING, 0, NULL);
+    if (device == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+    hr = check_offline_disk(device, disk, &disk->read_only);
+    CloseHandle(device);
+    return hr;
+}
+
+HRESULT physical_disk_make_writable(const PhysicalDisk *disk)
+{
+    if (!disk->read_only) return S_FALSE;
+
+    HANDLE device = CreateFileW(disk->path, GENERIC_READ | GENERIC_WRITE,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (device == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+
+    BOOL read_only;
+    HRESULT hr = check_offline_disk(device, disk, &read_only);
+    if (SUCCEEDED(hr) && read_only) {
+        SET_DISK_ATTRIBUTES attrs = {0};
+        DWORD bytes;
+        attrs.Version = sizeof(attrs);
+        attrs.Persist = TRUE;
+        attrs.AttributesMask = DISK_ATTRIBUTE_READ_ONLY;
+        if (!DeviceIoControl(device, IOCTL_DISK_SET_DISK_ATTRIBUTES, &attrs, sizeof(attrs),
+                             NULL, 0, &bytes, NULL)) {
+            hr = HRESULT_FROM_WIN32(GetLastError());
+        } else {
+            hr = check_offline_disk(device, disk, &read_only);
+            if (SUCCEEDED(hr) && read_only) hr = HRESULT_FROM_WIN32(ERROR_WRITE_PROTECT);
+        }
+    }
+    CloseHandle(device);
+    return hr;
+}
 
 HRESULT vhdx_create(const wchar_t *path, ULONGLONG size_gb)
 {
@@ -809,8 +1131,8 @@ static BOOL generate_autounattend(const wchar_t *output_path,
             user_xml, b64_password);
     }
 
-    fclose(f);
-    return TRUE;
+    BOOL ok = !ferror(f);
+    return fclose(f) == 0 && ok;
 }
 
 /* ---- ISO creation via IMAPI2 ---- */
@@ -1027,8 +1349,12 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
 
     /* autounattend.xml */
     swprintf_s(file_path, MAX_PATH, L"%s\\autounattend.xml", staging);
-    if (!generate_autounattend(file_path, vm_name, admin_user, b64_pass, is_template, test_mode, lang))
-        ui_log(L"Warning: failed to write autounattend.xml");
+    if (!generate_autounattend(file_path, vm_name, admin_user, b64_pass, is_template, test_mode, lang)) {
+        ui_log(L"Failed to write autounattend.xml");
+        SecureZeroMemory(b64_pass, sizeof(b64_pass));
+        remove_staging_dir(staging);
+        return E_FAIL;
+    }
 
     /* Agent + input helper + VDD driver files + SSH MSI */
     stage_agent_and_setup(staging, res_dir, ssh_enabled, nat_network);

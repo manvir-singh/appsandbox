@@ -775,6 +775,10 @@ static BOOL save_vm_list(void)
         fwprintf(f, L"OsType=%s\n", VM_AT(i).os_type);
         fwprintf(f, L"ImagePath=%s\n", VM_AT(i).image_path);
         fwprintf(f, L"VhdxPath=%s\n", VM_AT(i).vhdx_path);
+        if (VM_AT(i).physical_disk_id[0]) {
+            fwprintf(f, L"PhysicalDiskId=%s\n", VM_AT(i).physical_disk_id);
+            fwprintf(f, L"HddGB=%lu\n", VM_AT(i).hdd_gb);
+        }
         fwprintf(f, L"RamMB=%lu\n", VM_AT(i).ram_mb);
         fwprintf(f, L"CpuCores=%lu\n", VM_AT(i).cpu_cores);
         fwprintf(f, L"GpuMode=%d\n", VM_AT(i).gpu_mode);
@@ -956,6 +960,8 @@ static void load_vm_list(void)
             wcscpy_s(vm->image_path, MAX_PATH, line + 10);
         else if (wcsncmp(line, L"VhdxPath=", 9) == 0)
             wcscpy_s(vm->vhdx_path, MAX_PATH, line + 9);
+        else if (wcsncmp(line, L"PhysicalDiskId=", 15) == 0)
+            wcsncpy_s(vm->physical_disk_id, MAX_PATH, line + 15, _TRUNCATE);
         else if (wcsncmp(line, L"RamMB=", 6) == 0)
             vm->ram_mb = (DWORD)_wtoi(line + 6);
         else if (wcsncmp(line, L"HddGB=", 6) == 0)
@@ -1017,10 +1023,11 @@ static void load_vm_list(void)
             wchar_t snap_dir[MAX_PATH];
             VM_AT(i).handle = NULL;
             VM_AT(i).running = FALSE;
-            refresh_disk_size(VM_AT(i).vhdx_path, &VM_AT(i).hdd_gb);
+            if (!VM_AT(i).physical_disk_id[0])
+                refresh_disk_size(VM_AT(i).vhdx_path, &VM_AT(i).hdd_gb);
             if (resolve_vm_gpu_selection(&VM_AT(i))) gpu_changed = TRUE;
             load_vm_state_json(&VM_AT(i));
-            if (get_vm_disk_root(VM_AT(i).vhdx_path, snap_dir) &&
+            if (!VM_AT(i).physical_disk_id[0] && get_vm_disk_root(VM_AT(i).vhdx_path, snap_dir) &&
                 wcslen(snap_dir) + 10 < MAX_PATH) {
                 wcscat_s(snap_dir, MAX_PATH, L"\\snapshots");
                 snapshot_init(&SNAP_AT(i), snap_dir);
@@ -1462,7 +1469,13 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         : hcs_create_vm(&args->config, vm);
     if (FAILED(hr)) {
         asb_log(L"Error: Failed to create compute system (0x%08X)", hr);
-        asb_alert(L"Failed to start VM, check its configuration.");
+        if (vm->physical_disk_id[0] && hr == E_ACCESSDENIED)
+            asb_alert(L"Windows denied the sandbox access to its storage. See the Log for details.");
+        else if (vm->physical_disk_id[0] && hr == HRESULT_FROM_WIN32(ERROR_WRITE_PROTECT))
+            asb_alert(L"The sandbox's physical disk is still write-protected. See the Log for details.");
+        else
+            asb_alert(vm->physical_disk_id[0] ? L"Could not attach the physical disk. Check that it is still offline and available."
+                                            : L"Failed to start VM, check its configuration.");
         /* HCS rejected the VM after we already created the HCN endpoint.
            Free the endpoint so its IP reservation doesn't leak into the
            next attempt as a phantom HCN_E_ADDR_INVALID_OR_RESERVED. */
@@ -1482,6 +1495,8 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         asb_log(L"Error: Failed to start VM (0x%08X)", hr);
         if (hr == (HRESULT)0x800705AF)
             asb_alert(L"The host doesn't have enough resources to start this VM.");
+        else if (vm->physical_disk_id[0] && hr == E_ACCESSDENIED)
+            asb_alert(L"Windows denied the sandbox access to its storage. See the Log for details.");
     } else {
         asb_log(L"VM \"%s\" started.", vm->name);
         /* Agent + IDD probe run for any OS: hcs_service_guid() resolves
@@ -3214,6 +3229,52 @@ ASB_API void asb_default_disk_directory(wchar_t *out, size_t out_len)
     _snwprintf_s(out, out_len, _TRUNCATE, L"%s\\AppSandbox", base);
 }
 
+static BOOL physical_disk_in_use(const PhysicalDisk *disk)
+{
+    BOOL used = FALSE;
+    EnterCriticalSection(&g_cs);
+    for (int i = 0; i < g_vm_count; i++) {
+        const wchar_t *assigned_id = VM_AT(i).physical_disk_id;
+        if (assigned_id[0] && (_wcsicmp(assigned_id, disk->id) == 0 ||
+                              _wcsicmp(assigned_id, disk->legacy_id) == 0)) {
+            used = TRUE;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_cs);
+    return used;
+}
+
+typedef struct {
+    AsbPhysicalDiskVisitor visit;
+    void *context;
+} PhysicalDiskList;
+
+static void append_available_physical_disk(const PhysicalDisk *disk, void *context)
+{
+    PhysicalDiskList *list = context;
+    ULONGLONG size_gb = disk->size_bytes >> 30;
+    if (size_gb >= ASB_API_MIN_HDD_GB && size_gb <= INT_MAX && !physical_disk_in_use(disk))
+        list->visit(disk->id, disk->name, disk->number, (DWORD)size_gb, disk->read_only, list->context);
+}
+
+ASB_API HRESULT asb_enum_physical_disks(AsbPhysicalDiskVisitor visit, void *context)
+{
+    if (!visit) return E_INVALIDARG;
+    PhysicalDiskList list = { visit, context };
+    return physical_disk_enum(NULL, append_available_physical_disk, &list);
+}
+
+ASB_API HRESULT asb_make_physical_disk_writable(const wchar_t *id)
+{
+    PhysicalDisk disk;
+    HRESULT hr = physical_disk_resolve(id, &disk);
+    if (FAILED(hr)) return hr;
+    if (physical_disk_in_use(&disk)) return HRESULT_FROM_WIN32(ERROR_BUSY);
+    if ((disk.size_bytes >> 30) < ASB_API_MIN_HDD_GB) return E_INVALIDARG;
+    return physical_disk_make_writable(&disk);
+}
+
 /* Each selected location receives an exclusive VM-named child, so cleanup
    never owns the selected parent. */
 static const wchar_t *resolve_disk_directory(const wchar_t *name,
@@ -3465,8 +3526,8 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
     return asb_vm_create_with_edid(config, created_id, NULL);
 }
 
-ASB_API HRESULT asb_vm_create_with_edid(const AsbVmConfig *config, AsbVmId *created_id,
-                                        const AsbEdid *edid)
+static HRESULT create_vm(const AsbVmConfig *config, AsbVmId *created_id,
+                         const AsbEdid *edid, const wchar_t *physical_disk_id)
 {
     if (created_id) *created_id = 0;
     if (g_config_load_failed) return E_FAIL;
@@ -3481,6 +3542,7 @@ ASB_API HRESULT asb_vm_create_with_edid(const AsbVmConfig *config, AsbVmId *crea
     int template_idx = -1;
     BOOL from_template = FALSE;
     const wchar_t *effective_os;
+    BOOL physical = physical_disk_id != NULL;
 
     if (!config || !config->name || config->name[0] == L'\0') {
         asb_log(L"Error: VM name is required.");
@@ -3539,6 +3601,42 @@ ASB_API HRESULT asb_vm_create_with_edid(const AsbVmConfig *config, AsbVmId *crea
     }
 
     ZeroMemory(&cfg, sizeof(cfg));
+    if (physical) {
+        PhysicalDisk disk;
+        if (_wcsicmp(effective_os, L"Windows") || config->is_template || from_template ||
+            !config->image_path || !config->image_path[0]) {
+            asb_alert(L"Physical disks require a Windows 11 ISO installation.");
+            return E_INVALIDARG;
+        }
+        DWORD path_len = GetFullPathNameW(config->image_path, MAX_PATH, cfg.image_path, NULL);
+        DWORD attrs = path_len && path_len < MAX_PATH ? GetFileAttributesW(cfg.image_path) : INVALID_FILE_ATTRIBUTES;
+        const wchar_t *extension = attrs != INVALID_FILE_ATTRIBUTES ? wcsrchr(cfg.image_path, L'.') : NULL;
+        if (!extension || _wcsicmp(extension, L".iso") ||
+            attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            asb_alert(L"Select an accessible Windows 11 ISO file.");
+            return E_INVALIDARG;
+        }
+        if (!*physical_disk_id || wcslen(physical_disk_id) >= MAX_PATH) {
+            asb_alert(L"Select an available physical disk.");
+            return E_INVALIDARG;
+        }
+        hr = physical_disk_resolve(physical_disk_id, &disk);
+        if (FAILED(hr) || (disk.size_bytes >> 30) < ASB_API_MIN_HDD_GB ||
+            (disk.size_bytes >> 30) > INT_MAX) {
+            asb_alert(L"The selected disk must be present, offline, writable, and at least 64 GB.");
+            return FAILED(hr) ? hr : E_INVALIDARG;
+        }
+        if (disk.read_only) {
+            asb_alert(L"The selected disk is read-only. Use Make writable in New Sandbox before installing Windows.");
+            return HRESULT_FROM_WIN32(ERROR_WRITE_PROTECT);
+        }
+        if (physical_disk_in_use(&disk)) {
+            asb_alert(L"The selected disk is already assigned to a sandbox.");
+            return HRESULT_FROM_WIN32(ERROR_BUSY);
+        }
+        wcscpy_s(cfg.physical_disk_id, MAX_PATH, disk.id);
+        cfg.hdd_gb = (DWORD)(disk.size_bytes >> 30);
+    }
 
     /* Copy config strings into local VmConfig */
     if (edid) {
@@ -3548,7 +3646,7 @@ ASB_API HRESULT asb_vm_create_with_edid(const AsbVmConfig *config, AsbVmId *crea
     }
     wcscpy_s(cfg.name, 256, config->name);
     if (effective_os) wcscpy_s(cfg.os_type, 32, effective_os);
-    if (config->image_path) wcscpy_s(cfg.image_path, MAX_PATH, config->image_path);
+    if (!physical && config->image_path) wcscpy_s(cfg.image_path, MAX_PATH, config->image_path);
     {
         size_t user_length;
         const wchar_t *user = trimmed_username(config->username, &user_length);
@@ -3556,7 +3654,7 @@ ASB_API HRESULT asb_vm_create_with_edid(const AsbVmConfig *config, AsbVmId *crea
     }
     wcscpy_s(cfg.admin_pass, ARRAYSIZE(cfg.admin_pass), config->password);
     cfg.ram_mb = config->ram_mb;
-    cfg.hdd_gb = config->hdd_gb;
+    if (!physical) cfg.hdd_gb = config->hdd_gb;
     cfg.cpu_cores = config->cpu_cores;
     cfg.gpu_mode = config->gpu_mode;
     if (config->gpu_id && config->gpu_id[0])
@@ -3730,7 +3828,7 @@ ASB_API HRESULT asb_vm_create_with_edid(const AsbVmConfig *config, AsbVmId *crea
 
     /* ---- VHDX-first path (Windows, from ISO) ---- */
     {
-        BOOL use_vhdx_first = (!from_template &&
+        BOOL use_vhdx_first = (!physical && !from_template &&
                                 _wcsicmp(cfg.os_type, L"Windows") == 0 &&
                                 cfg.image_path[0] != L'\0' &&
                                 (is_template_create || cfg.admin_pass[0] != L'\0'));
@@ -3910,14 +4008,16 @@ build_failed:
     /* Populate name early so log lines (e.g. NAT IP allocation) identify the VM. */
     wcscpy_s(inst->name, 256, cfg.name);
 
-    asb_log(L"Creating VHDX: %s (%lu GB)...", cfg.vhdx_path, cfg.hdd_gb);
-    hr = vhdx_create(cfg.vhdx_path, (ULONGLONG)cfg.hdd_gb);
-    if (FAILED(hr)) {
-        asb_log(L"Error: Failed to create VHDX (0x%08X)", hr);
-        remove_dir_recursive(vhdx_dir);
-        return hr;
+    if (!physical) {
+        asb_log(L"Creating VHDX: %s (%lu GB)...", cfg.vhdx_path, cfg.hdd_gb);
+        hr = vhdx_create(cfg.vhdx_path, (ULONGLONG)cfg.hdd_gb);
+        if (FAILED(hr)) {
+            asb_log(L"Error: Failed to create VHDX (0x%08X)", hr);
+            remove_dir_recursive(vhdx_dir);
+            return hr;
+        }
+        asb_log(L"VHDX created successfully.");
     }
-    asb_log(L"VHDX created successfully.");
 
     /* Resources ISO */
     {
@@ -3953,6 +4053,11 @@ build_failed:
         }
     }
     SecureZeroMemory(cfg.admin_pass, sizeof(cfg.admin_pass));
+    if (physical && !cfg.resources_iso_path[0]) {
+        asb_alert(L"Could not prepare the Windows installation media for the physical disk.");
+        remove_dir_recursive(vhdx_dir);
+        return E_FAIL;
+    }
 
     inst->network_cleaned = FALSE;
 
@@ -3974,7 +4079,11 @@ build_failed:
         : hcs_create_vm(&cfg, inst);
     if (FAILED(hr)) {
         asb_log(L"Error: Failed to create compute system (0x%08X)", hr);
-        asb_alert(L"Failed to start VM, check its configuration.");
+        if (physical && hr == E_ACCESSDENIED)
+            asb_alert(L"Windows denied the sandbox access to its storage. See the Log for details.");
+        else
+            asb_alert(physical ? L"Could not attach the physical disk or installation media. Check that the disk is still offline and available."
+                               : L"Failed to start VM, check its configuration.");
         /* HCS rejected the VM after we already created the HCN endpoint.
            Free the endpoint so its IP reservation doesn't leak. */
         if (endpoint_guid_str[0] != L'\0') {
@@ -3993,9 +4102,27 @@ build_failed:
     inst->ssh_deploy_key = cfg.ssh_deploy_key;
     if (cfg.ssh_deploy_key) wcscpy_s(inst->ssh_pubkey, 512, ssh_pubkey);
 
-    { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
-      snapshot_init(&SNAP_AT(g_vm_count), sd); }
+    if (!physical) {
+        wchar_t sd[MAX_PATH];
+        swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
+        snapshot_init(&SNAP_AT(g_vm_count), sd);
+    }
+    inst->starting = physical;
     g_vm_count++;
+
+    if (physical && !save_vm_list()) {
+        hcs_close_vm(inst);
+        hcs_destroy_stale(inst->name);
+        hcs_release_physical_disk_access(inst);
+        if (endpoint_guid_str[0]) hcn_delete_endpoint(&inst->endpoint_id);
+        EnterCriticalSection(&g_cs);
+        remove_vm_record(vm_index_of(vm_handle(inst)));
+        LeaveCriticalSection(&g_cs);
+        if (created_id) *created_id = 0;
+        remove_dir_recursive(vhdx_dir);
+        asb_alert(L"Could not save the physical disk assignment. Windows Setup did not start.");
+        return E_FAIL;
+    }
 
     if (!is_template_create)
         vm_save_state_json(inst);
@@ -4003,6 +4130,7 @@ build_failed:
     /* Auto-start */
     asb_log(L"Starting VM \"%s\"...", cfg.name);
     hr = hcs_start_vm(inst);
+    inst->starting = FALSE;
     if (SUCCEEDED(hr)) {
         hcs_start_monitor(inst);
         vm_agent_start(inst);
@@ -4012,6 +4140,8 @@ build_failed:
         asb_log(L"VM \"%s\" created but failed to start (0x%08X).", cfg.name, hr);
         if (hr == (HRESULT)0x800705AF)
             asb_alert(L"The host doesn't have enough resources to start this VM.");
+        else if (physical && hr == E_ACCESSDENIED)
+            asb_alert(L"Windows denied the sandbox access to its storage. See the Log for details.");
         else
             asb_alert(L"Failed to start VM, check its configuration.");
     }
@@ -4020,6 +4150,19 @@ build_failed:
 
     notify_state(vm_handle(inst), inst->running, g_state_ud);
     return S_OK;
+}
+
+ASB_API HRESULT asb_vm_create_with_edid(const AsbVmConfig *config, AsbVmId *created_id,
+                                        const AsbEdid *edid)
+{
+    return create_vm(config, created_id, edid, NULL);
+}
+
+ASB_API HRESULT asb_vm_create_on_physical_disk(const AsbVmConfig *config, AsbVmId *created_id,
+                                               const AsbEdid *edid, const wchar_t *disk_id)
+{
+    if (!disk_id || !*disk_id) return E_INVALIDARG;
+    return create_vm(config, created_id, edid, disk_id);
 }
 
 /* ---- VM Start ---- */
@@ -4034,6 +4177,9 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
     if (idx < 0) return E_INVALIDARG;
     inst = &VM_AT(idx);
     if (inst->starting || inst->building_vhdx) return E_ACCESSDENIED;
+    BOOL physical = inst->physical_disk_id[0] != L'\0';
+    if (physical && (snap_idx >= 0 || snap_idx == -2))
+        return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     SnapshotTree *tree = &SNAP_AT(idx);
 
     if (inst->running) { asb_log(L"VM \"%s\" is already running.", inst->name); return S_FALSE; }
@@ -4073,7 +4219,7 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         save_vm_list();
     }
 
-    {
+    if (!physical) {
         HRESULT hr = snapshot_ensure_writable(tree, inst);
         if (FAILED(hr)) {
             asb_log(L"Error: Failed to create working branch (0x%08X)", hr);
@@ -4084,9 +4230,13 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
             if (inst->handle) hcs_close_vm(inst);
             save_vm_list();
         }
+        refresh_disk_size(inst->vhdx_path, &inst->hdd_gb);
+    } else if (inst->handle) {
+        /* Recreate any retained stopped system using the disk's current attachment. */
+        hcs_close_vm(inst);
+        asb_vm_cleanup_network(inst);
     }
 
-    refresh_disk_size(inst->vhdx_path, &inst->hdd_gb);
     if (!inst->handle) {
         /* Need to re-create HCS system - do it in a background thread */
         StartVmArgs *args = (StartVmArgs *)calloc(1, sizeof(StartVmArgs));
@@ -4094,8 +4244,10 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         args->vm = inst;
         wcscpy_s(args->config.name, 256, inst->name);
         wcscpy_s(args->config.os_type, 32, inst->os_type);
-        wcscpy_s(args->config.image_path, MAX_PATH, inst->image_path);
+        if (!physical || !inst->install_complete)
+            wcscpy_s(args->config.image_path, MAX_PATH, inst->image_path);
         wcscpy_s(args->config.vhdx_path, MAX_PATH, inst->vhdx_path);
+        wcscpy_s(args->config.physical_disk_id, MAX_PATH, inst->physical_disk_id);
         args->config.ram_mb = inst->ram_mb;
         args->config.hdd_gb = inst->hdd_gb;
         args->config.cpu_cores = inst->cpu_cores;
@@ -4106,7 +4258,8 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         args->config.test_mode = inst->test_mode;
         wcscpy_s(args->config.admin_user, 128, inst->admin_user);
         args->config.ssh_enabled = inst->ssh_enabled;
-        wcscpy_s(args->config.resources_iso_path, MAX_PATH, inst->resources_iso_path);
+        if (!physical || !inst->install_complete)
+            wcscpy_s(args->config.resources_iso_path, MAX_PATH, inst->resources_iso_path);
         inst->network_cleaned = FALSE;
         asb_log(L"Starting VM \"%s\" (background)...", inst->name);
         if (inst->start_thread) CloseHandle(inst->start_thread);
@@ -4132,6 +4285,8 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
             asb_log(L"Error: Failed to start VM (0x%08X)", hr);
             if (hr == (HRESULT)0x800705AF)
                 asb_alert(L"The host doesn't have enough resources to start this VM.");
+            else if (physical && hr == E_ACCESSDENIED)
+                asb_alert(L"Windows denied the sandbox access to its storage. See the Log for details.");
             return hr;
         }
         asb_log(L"VM \"%s\" started.", inst->name);
@@ -4277,6 +4432,8 @@ static HRESULT delete_instance(AsbVm vm,BOOL template_resource)
         save_vm_list();
         return hr;
     }
+
+    hcs_release_physical_disk_access(inst);
 
     /* Compact arrays */
     EnterCriticalSection(&g_cs);
@@ -4504,6 +4661,7 @@ ASB_API HRESULT asb_vm_set_disk_size(AsbVm vm, DWORD hdd_gb)
     if (idx < 0) return E_INVALIDARG;
     VmInstance *inst = &VM_AT(idx);
     if (!vm_config_editable(inst)) return E_ACCESSDENIED;
+    if (inst->physical_disk_id[0]) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     refresh_disk_size(inst->vhdx_path, &inst->hdd_gb);
     if (!hdd_gb || hdd_gb > INT_MAX || hdd_gb < inst->hdd_gb) return E_INVALIDARG;
     if (hdd_gb == inst->hdd_gb) return S_FALSE;
@@ -4588,6 +4746,7 @@ ASB_API HRESULT asb_snap_take(AsbVm vm, const wchar_t *name)
     int idx = vm_index_of(vm);
     wchar_t snap_name[128];
     if (idx < 0) return E_INVALIDARG;
+    if (VM_AT(idx).physical_disk_id[0]) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
     if (VM_AT(idx).running) { asb_log(L"VM must be stopped to take a snapshot."); return E_ACCESSDENIED; }
 
@@ -4840,7 +4999,7 @@ static HRESULT delete_template_index(int index)
         GUID disk_id, parent_id;
         wchar_t base_path[MAX_PATH], root[MAX_PATH];
         const wchar_t *base;
-        if (VM_AT(i).building_vhdx) continue;
+        if (VM_AT(i).building_vhdx || VM_AT(i).physical_disk_id[0]) continue;
         base = SNAP_AT(i).base_vhdx;
         if (!base[0]) {
             if (!get_vm_disk_root(VM_AT(i).vhdx_path, root) ||

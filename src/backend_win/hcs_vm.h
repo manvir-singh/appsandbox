@@ -33,7 +33,7 @@ typedef struct {
     wchar_t name[256];
     wchar_t os_type[32];          /* L"Windows" or L"Linux" */
     wchar_t image_path[MAX_PATH]; /* ISO path */
-    wchar_t vhdx_path[MAX_PATH];  /* will be created if doesn't exist */
+    wchar_t vhdx_path[MAX_PATH];  /* VM storage path, or metadata anchor for a physical disk */
     DWORD   ram_mb;
     DWORD   hdd_gb;
     DWORD   cpu_cores;
@@ -50,6 +50,7 @@ typedef struct {
     BOOL    test_mode;               /* TRUE = disable Secure Boot (for test-signed drivers) */
     BOOL    ssh_enabled;             /* TRUE = install OpenSSH Server in guest */
     BOOL    ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
+    wchar_t physical_disk_id[MAX_PATH];
 } VmConfig;
 
 /* Runtime state of a VM */
@@ -116,6 +117,7 @@ typedef struct {
     volatile LONG agent_version;
     volatile LONG legacy_disk_resize_supported;
     BOOL        state_save_pending;
+    wchar_t     physical_disk_id[MAX_PATH];
 } VmInstance;
 
 /* Initialize HCS - loads computecore.dll dynamically.
@@ -127,6 +129,9 @@ void hcs_cleanup(void);
 
 /* Destroy a stale HCS system left over from a previous run. */
 void hcs_destroy_stale(const wchar_t *name);
+
+/* Revoke the VM-specific grant after the physical disk assignment is removed. */
+void hcs_release_physical_disk_access(const VmInstance *instance);
 
 /* Create a VM from configuration. Populates instance on success. */
 HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance);
@@ -190,12 +195,6 @@ ASB_API void hcs_stop_monitor(VmInstance *instance);
    endpoint_guid is the HCN endpoint GUID string (NULL if no network). */
 HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpoint_guid,
                                      VmInstance *instance);
-
-/* Build the HCS JSON document for creating a VM.
-   json_out must be at least json_out_chars wide chars.
-   endpoint_guid is the HCN endpoint GUID string (NULL if no network). */
-BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
-                       wchar_t *json_out, size_t json_out_chars);
 
 /* Compute the AppSandbox service GUID for a guest OS and port.
      Windows guests get a5b0cafe-<port>-4000-8000-000000000001.

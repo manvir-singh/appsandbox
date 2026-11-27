@@ -39,7 +39,7 @@ typedef HRESULT (WINAPI *PFN_HcsModifyComputeSystem)(
     HCS_SYSTEM cs, HCS_OPERATION op, PCWSTR configuration, HANDLE identity);
 typedef HRESULT (WINAPI *PFN_HcsOpenComputeSystem)(
     PCWSTR id, DWORD requestedAccess, HCS_SYSTEM *cs);
-typedef HRESULT (WINAPI *PFN_HcsGrantVmAccess)(
+typedef HRESULT (WINAPI *PFN_HcsVmAccess)(
     PCWSTR vmId, PCWSTR filePath);
 typedef HRESULT (WINAPI *PFN_HcsCreateEmptyGuestStateFile)(PCWSTR path);
 typedef HRESULT (WINAPI *PFN_HcsCreateEmptyRuntimeStateFile)(PCWSTR path);
@@ -115,7 +115,8 @@ static PFN_HcsSaveComputeSystem        pfnSave;
 static PFN_HcsGetComputeSystemProperties pfnGetProps;
 static PFN_HcsModifyComputeSystem      pfnModify;
 static PFN_HcsOpenComputeSystem        pfnOpen;
-static PFN_HcsGrantVmAccess           pfnGrantAccess;
+static PFN_HcsVmAccess                pfnGrantAccess;
+static PFN_HcsVmAccess                pfnRevokeAccess;
 static PFN_HcsCreateEmptyGuestStateFile   pfnCreateVmgs;
 static PFN_HcsCreateEmptyRuntimeStateFile pfnCreateVmrs;
 static PFN_HcsEnumerateComputeSystems     pfnEnumSystems;
@@ -680,7 +681,8 @@ BOOL hcs_init(void)
     pfnGetProps  = (PFN_HcsGetComputeSystemProperties)GetProcAddress(g_hcs_dll, "HcsGetComputeSystemProperties");
     pfnModify    = (PFN_HcsModifyComputeSystem)GetProcAddress(g_hcs_dll, "HcsModifyComputeSystem");
     pfnOpen      = (PFN_HcsOpenComputeSystem)GetProcAddress(g_hcs_dll, "HcsOpenComputeSystem");
-    pfnGrantAccess = (PFN_HcsGrantVmAccess)GetProcAddress(g_hcs_dll, "HcsGrantVmAccess");
+    pfnGrantAccess = (PFN_HcsVmAccess)GetProcAddress(g_hcs_dll, "HcsGrantVmAccess");
+    pfnRevokeAccess = (PFN_HcsVmAccess)GetProcAddress(g_hcs_dll, "HcsRevokeVmAccess");
     pfnCreateVmgs  = (PFN_HcsCreateEmptyGuestStateFile)GetProcAddress(g_hcs_dll, "HcsCreateEmptyGuestStateFile");
     pfnCreateVmrs  = (PFN_HcsCreateEmptyRuntimeStateFile)GetProcAddress(g_hcs_dll, "HcsCreateEmptyRuntimeStateFile");
     pfnEnumSystems = (PFN_HcsEnumerateComputeSystems)GetProcAddress(g_hcs_dll, "HcsEnumerateComputeSystems");
@@ -909,14 +911,16 @@ static BOOL hcs_ensure_state_file(PCWSTR path, HRESULT (WINAPI *create_file)(PCW
     return SUCCEEDED(hr);
 }
 
-BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
-                       wchar_t *json_out, size_t json_out_chars)
+static BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
+                              const wchar_t *physical_path, wchar_t *json_out, size_t json_out_chars)
 {
-    wchar_t vhdx_esc[MAX_PATH * 2];
+    wchar_t disk_esc[MAX_PATH * 2];
+    wchar_t iso_esc[MAX_PATH * 2];
     wchar_t res_esc[MAX_PATH * 2];
     wchar_t vmgs_esc[MAX_PATH * 2];
     wchar_t vmrs_esc[MAX_PATH * 2];
-    wchar_t res_section[512];
+    wchar_t iso_section[MAX_PATH * 2 + 64] = {0};
+    wchar_t res_section[MAX_PATH * 2 + 64] = {0};
     wchar_t net_section[512];
     wchar_t secureboot_section[512];
     wchar_t nested_section[128];
@@ -937,13 +941,18 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
 
     is_windows = (_wcsicmp(config->os_type, L"Windows") == 0);
 
-    escape_json_path(config->vhdx_path, vhdx_esc, MAX_PATH * 2);
+    escape_json_path(physical_path ? physical_path : config->vhdx_path, disk_esc, ARRAYSIZE(disk_esc));
+
+    if (physical_path && config->image_path[0]) {
+        escape_json_path(config->image_path, iso_esc, ARRAYSIZE(iso_esc));
+        swprintf_s(iso_section, ARRAYSIZE(iso_section),
+            L",\"1\":{\"Type\":\"Iso\",\"Path\":\"%s\"}", iso_esc);
+    }
 
     /* Optional resources ISO at SCSI slot 2 (autounattend + agent + helpers) */
-    res_section[0] = L'\0';
     if (config->resources_iso_path[0] != L'\0') {
         escape_json_path(config->resources_iso_path, res_esc, MAX_PATH * 2);
-        swprintf_s(res_section, 512,
+        swprintf_s(res_section, ARRAYSIZE(res_section),
             L",\"2\":{\"Type\":\"Iso\",\"Path\":\"%s\"}", res_esc);
     }
 
@@ -1002,14 +1011,20 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         L"\"RuntimeStateFilePath\":\"%s\""
         L"}", vmgs_esc, vmrs_esc);
 
-    /* VideoMonitor is REQUIRED for all OSes — vmwp.exe crashes (0xC0000005)
-       without it. No ConnectionOptions/named pipe — IDD via agent is the
-       display path. (Matches master branch hcs_vm.c.) */
-    wcscpy_s(video_section, 1024,
-        L"\"VideoMonitor\":{"
-            L"\"HorizontalResolution\":1024,"
-            L"\"VerticalResolution\":768"
-        L"},");
+    /* Setup needs a console before the guest agent can provide an IDD display. */
+    if (physical_path && config->image_path[0]) {
+        wchar_t user_sid[128];
+        wchar_t name_esc[ARRAYSIZE(config->name) * 2];
+        if (!get_current_user_sid_string(user_sid, ARRAYSIZE(user_sid))) return FALSE;
+        escape_json_path(config->name, name_esc, ARRAYSIZE(name_esc));
+        swprintf_s(video_section, ARRAYSIZE(video_section),
+            L"\"VideoMonitor\":{\"HorizontalResolution\":1024,\"VerticalResolution\":768,"
+            L"\"ConnectionOptions\":{\"NamedPipe\":\"\\\\\\\\.\\\\pipe\\\\%s.BasicSession\",\"AccessSids\":[\"%s\"]}},",
+            name_esc, user_sid);
+    } else {
+        wcscpy_s(video_section, ARRAYSIZE(video_section),
+            L"\"VideoMonitor\":{\"HorizontalResolution\":1024,\"VerticalResolution\":768},");
+    }
 
     /* ComPorts — virtual COM1 wired to a named pipe (\\.\pipe\<vm>.com1)
        for Linux VMs. systemd's StandardOutput=journal+console writes
@@ -1154,7 +1169,8 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                 L"\"Scsi\":{"
                     L"\"Primary\":{"
                         L"\"Attachments\":{"
-                            L"\"0\":{\"Type\":\"VirtualDisk\",\"Path\":\"%s\"}"
+                            L"\"0\":{\"Type\":\"%s\",\"Path\":\"%s\"}"
+                            L"%s"
                             L"%s"
                         L"}"
                     L"}"
@@ -1178,7 +1194,9 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         config->ram_mb,
         config->cpu_cores,
         nested_section,
-        vhdx_esc,
+        physical_path ? L"PassThru" : L"VirtualDisk",
+        disk_esc,
+        iso_section,
         res_section,
         video_section,
         comports_section,
@@ -1193,99 +1211,30 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
 
 HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
 {
-    wchar_t json[16384];
-    HCS_OPERATION op;
-    HRESULT hr;
+    return hcs_create_vm_with_endpoint(config, NULL, instance);
+}
 
-    if (!g_hcs_dll || !pfnCreate)
-        return E_NOT_VALID_STATE;
+static void revoke_physical_disk_access(const wchar_t *vm_name, const wchar_t *path)
+{
+    if (!g_hcs_dll || !pfnRevokeAccess) return;
+    HRESULT hr = pfnRevokeAccess(vm_name, path);
+    if (FAILED(hr)) ui_log(L"Could not revoke VM access to the physical disk (0x%08X).", hr);
+}
 
-    /* Wait for VHDX to be released by old vmwp.exe (up to 3s) */
-    if (!wait_for_file_available(config->vhdx_path, 3000)) {
-        ui_log(L"Error: VHDX file is still locked. Reboot or kill vmwp.exe in Task Manager.");
-        return HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION);
-    }
-
-    /* Grant VM access to VHDX and ISO files (required by vmwp.exe).
-       After reboot, stale HcsGrantVmAccess ACLs may persist on reused files —
-       reset DACL if grant fails with ACCESS_DENIED. */
-    if (pfnGrantAccess) {
-        HRESULT grant_hr;
-        grant_hr = pfnGrantAccess(config->name, config->vhdx_path);
-        if (FAILED(grant_hr)) {
-            ui_log(L"GrantVmAccess failed on VHDX (0x%08X), resetting DACL...", grant_hr);
-            { wchar_t tmp[MAX_PATH]; wcscpy_s(tmp, MAX_PATH, config->vhdx_path);
-            SetNamedSecurityInfoW(tmp, SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION, NULL, NULL, NULL, NULL); }
-            grant_hr = pfnGrantAccess(config->name, config->vhdx_path);
-            if (FAILED(grant_hr))
-                ui_log(L"Warning: GrantVmAccess retry on VHDX failed (0x%08X)", grant_hr);
-        }
-        if (config->resources_iso_path[0] != L'\0')
-            pfnGrantAccess(config->name, config->resources_iso_path);
-    }
-
-    /* Build JSON — endpoint_guid is set later by caller if networking is used */
-    if (!hcs_build_vm_json(config, NULL, json, 16384))
-        return E_FAIL;
-
-    /* Dump JSON to file for debugging */
-    {
-        FILE *dbg = NULL;
-        _wfopen_s(&dbg, L"C:\\ProgramData\\AppSandbox\\last_vm.json", L"w,ccs=UTF-8");
-        if (dbg) { fwprintf(dbg, L"%s", json); fclose(dbg); }
-    }
-
-    /* Destroy any stale system with the same name before creating */
-    hcs_destroy_stale(config->name);
-
-    op = pfnCreateOp(NULL, NULL);
-    if (!op)
-        return E_OUTOFMEMORY;
-
-    hr = pfnCreate(config->name, json, op, NULL, &instance->handle);
-    hr = hcs_exec_and_wait(hr, op);
-
-    /* Retry once — hcs_destroy_stale may have terminated a stuck system */
-    if (hr == (HRESULT)0x8037010DL || hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
-        ui_log(L"Retrying VM create after stale cleanup...");
-        pump_sleep(2000);
-        op = pfnCreateOp(NULL, NULL);
-        if (op) {
-            hr = pfnCreate(config->name, json, op, NULL, &instance->handle);
-            hr = hcs_exec_and_wait(hr, op);
-        }
-    }
-
-    if (SUCCEEDED(hr)) {
-        wcscpy_s(instance->name, 256, config->name);
-        wcscpy_s(instance->os_type, 32, config->os_type);
-        wcscpy_s(instance->vhdx_path, MAX_PATH, config->vhdx_path);
-        wcscpy_s(instance->image_path, MAX_PATH, config->image_path);
-        instance->ram_mb = config->ram_mb;
-        instance->hdd_gb = config->hdd_gb;
-        instance->cpu_cores = config->cpu_cores;
-        instance->gpu_mode = config->gpu_mode;
-        wcscpy_s(instance->gpu_id, 512, config->gpu_id);
-        instance->network_mode = config->network_mode;
-        instance->is_template = config->is_template;
-        instance->test_mode = config->test_mode;
-        wcscpy_s(instance->admin_user, 128, config->admin_user);
-        instance->ssh_enabled = config->ssh_enabled;
-        memcpy(&instance->gpu_shares, &config->gpu_shares, sizeof(GpuDriverShareList));
-        instance->running = FALSE;
-
-        /* Register callback after create, before start */
-        hcs_register_vm_callback(instance);
-    }
-
-    return hr;
+void hcs_release_physical_disk_access(const VmInstance *instance)
+{
+    if (!g_hcs_dll || !pfnRevokeAccess || !instance->physical_disk_id[0]) return;
+    PhysicalDisk disk;
+    if (SUCCEEDED(physical_disk_resolve(instance->physical_disk_id, &disk)))
+        revoke_physical_disk_access(instance->name, disk.path);
 }
 
 HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpoint_guid,
                                      VmInstance *instance)
 {
     wchar_t json[16384];
+    PhysicalDisk disk;
+    BOOL physical = config->physical_disk_id[0] != L'\0';
     HCS_OPERATION op;
     HRESULT hr;
 
@@ -1293,7 +1242,7 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
         return E_NOT_VALID_STATE;
 
     /* Wait for VHDX to be released by old vmwp.exe (up to 3s) */
-    if (!wait_for_file_available(config->vhdx_path, 3000)) {
+    if (!physical && !wait_for_file_available(config->vhdx_path, 3000)) {
         ui_log(L"Error: VHDX file is still locked. Reboot or kill vmwp.exe in Task Manager.");
         return HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION);
     }
@@ -1301,7 +1250,7 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
     /* Grant VM access to VHDX and ISO files (required by vmwp.exe).
        After reboot, stale HcsGrantVmAccess ACLs may persist on reused files —
        reset DACL if grant fails. */
-    if (pfnGrantAccess) {
+    if (pfnGrantAccess && !physical) {
         HRESULT grant_hr;
         grant_hr = pfnGrantAccess(config->name, config->vhdx_path);
         if (FAILED(grant_hr)) {
@@ -1313,11 +1262,37 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
             if (FAILED(grant_hr))
                 ui_log(L"Warning: GrantVmAccess retry on VHDX failed (0x%08X)", grant_hr);
         }
-        if (config->resources_iso_path[0] != L'\0')
-            pfnGrantAccess(config->name, config->resources_iso_path);
+    }
+    if (pfnGrantAccess && config->resources_iso_path[0])
+        pfnGrantAccess(config->name, config->resources_iso_path);
+    if (pfnGrantAccess && physical && config->image_path[0])
+        pfnGrantAccess(config->name, config->image_path);
+
+    if (physical) {
+        hcs_destroy_stale(config->name);
+        hr = physical_disk_resolve(config->physical_disk_id, &disk);
+        if (FAILED(hr)) {
+            ui_log(L"The selected physical disk must be present and offline (0x%08X).", hr);
+            return hr;
+        }
+        if (disk.read_only) {
+            /* Windows can reapply read-only when returning a host-used disk offline. */
+            if (instance->running || !instance->physical_disk_id[0] ||
+                _wcsicmp(instance->physical_disk_id, config->physical_disk_id) != 0) {
+                ui_log(L"Physical Disk %lu is read-only.", disk.number);
+                return HRESULT_FROM_WIN32(ERROR_WRITE_PROTECT);
+            }
+            hr = physical_disk_make_writable(&disk);
+            if (FAILED(hr)) {
+                ui_log(L"Could not clear the Windows read-only setting for assigned physical Disk %lu (0x%08X).",
+                       disk.number, hr);
+                return hr;
+            }
+            ui_log(L"Physical Disk %lu is writable and remains offline on the host.", disk.number);
+        }
     }
 
-    if (!hcs_build_vm_json(config, endpoint_guid, json, 16384))
+    if (!hcs_build_vm_json(config, endpoint_guid, physical ? disk.path : NULL, json, ARRAYSIZE(json)))
         return E_FAIL;
 
     /* Dump JSON to file for debugging */
@@ -1327,18 +1302,29 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
         if (dbg) { fwprintf(dbg, L"%s", json); fclose(dbg); }
     }
 
-    /* Destroy any stale system with the same name before creating */
-    hcs_destroy_stale(config->name);
+    if (!physical) hcs_destroy_stale(config->name);
 
     op = pfnCreateOp(NULL, NULL);
     if (!op)
         return E_OUTOFMEMORY;
 
+    if (physical) {
+        /* Use the same device path and compute system ID as the attachment. */
+        hr = pfnGrantAccess ? pfnGrantAccess(config->name, disk.path)
+                            : HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+        if (FAILED(hr)) {
+            pfnCloseOp(op);
+            ui_log(L"Error: Could not grant VM \"%s\" access to physical Disk %lu (0x%08X).",
+                   config->name, disk.number, hr);
+            return hr;
+        }
+    }
+
     hr = pfnCreate(config->name, json, op, NULL, &instance->handle);
     hr = hcs_exec_and_wait(hr, op);
 
     /* Retry once — hcs_destroy_stale may have terminated a stuck system */
-    if (hr == (HRESULT)0x8037010DL || hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
+    if (!physical && (hr == (HRESULT)0x8037010DL || hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS))) {
         ui_log(L"Retrying VM create after stale cleanup...");
         pump_sleep(2000);
         op = pfnCreateOp(NULL, NULL);
@@ -1352,7 +1338,9 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
         wcscpy_s(instance->name, 256, config->name);
         wcscpy_s(instance->os_type, 32, config->os_type);
         wcscpy_s(instance->vhdx_path, MAX_PATH, config->vhdx_path);
-        wcscpy_s(instance->image_path, MAX_PATH, config->image_path);
+        wcscpy_s(instance->physical_disk_id, MAX_PATH, config->physical_disk_id);
+        if (!physical || config->image_path[0])
+            wcscpy_s(instance->image_path, MAX_PATH, config->image_path);
         instance->ram_mb = config->ram_mb;
         instance->hdd_gb = config->hdd_gb;
         instance->cpu_cores = config->cpu_cores;
@@ -1368,6 +1356,12 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
 
         /* Register callback after create, before start */
         hcs_register_vm_callback(instance);
+    } else if (physical) {
+        if (instance->handle) {
+            hcs_close_handle_sync(instance->handle);
+            instance->handle = NULL;
+        }
+        revoke_physical_disk_access(config->name, disk.path);
     }
 
     return hr;

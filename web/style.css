@@ -90,6 +90,9 @@ h2.collapsible:hover { color: var(--text); }
     min-height: 26px;
 }
 
+.form-grid > [hidden] { display: none; }
+#physical-disk { max-width: 100%; min-width: 0; }
+
 .form-row .host-info {
     font-size: 11px;
     color: var(--text-dim);

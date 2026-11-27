@@ -13,6 +13,22 @@
 #  define ASB_IS_ARM64 0
 #endif
 
+typedef struct {
+    wchar_t id[MAX_PATH];
+    wchar_t legacy_id[MAX_PATH]; /* MSFT_Disk identity used by earlier builds */
+    wchar_t path[MAX_PATH];
+    wchar_t name[128];
+    DWORD number;
+    ULONGLONG size_bytes;
+    BOOL read_only;
+} PhysicalDisk;
+
+/* With an ID, report only the matching disk and reject ambiguous identities. */
+typedef void (*PhysicalDiskVisitor)(const PhysicalDisk *disk, void *context);
+HRESULT physical_disk_enum(const wchar_t *id, PhysicalDiskVisitor visit, void *context);
+HRESULT physical_disk_resolve(const wchar_t *id, PhysicalDisk *disk);
+HRESULT physical_disk_make_writable(const PhysicalDisk *disk);
+
 /* Create a new dynamically-expanding VHDX file.
    size_gb: maximum virtual size in gigabytes. */
 HRESULT vhdx_create(const wchar_t *path, ULONGLONG size_gb);

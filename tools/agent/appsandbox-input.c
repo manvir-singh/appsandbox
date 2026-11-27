@@ -16,8 +16,11 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
 
 #pragma comment(lib, "user32.lib")
+
+#define INPUT_BATCH_PACKETS 32
 
 typedef struct {
     BYTE scan[2][256];
@@ -63,11 +66,24 @@ static BOOL initialize_dpi_awareness(void)
 
 static void switch_to_input_desktop(void)
 {
+    /* The connection loop runs on one thread. Keep its active desktop handle
+       until a switch, since CloseDesktop cannot close a handle in use. */
+    static HDESK current;
+    static HDESK opened;
+    BOOL receives_input = FALSE;
+    if (!current) current = GetThreadDesktop(GetCurrentThreadId());
+    if (current && GetUserObjectInformationW(current, UOI_IO, &receives_input,
+                                              sizeof(receives_input), NULL) && receives_input)
+        return;
+
     HDESK desk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
-    if (desk) {
-        SetThreadDesktop(desk);
+    if (!desk) return;
+    if (!SetThreadDesktop(desk)) {
         CloseDesktop(desk);
+        return;
     }
+    if (opened) CloseDesktop(opened);
+    current = opened = desk;
 }
 
 /* ---- Input injection ---- */
@@ -186,15 +202,23 @@ static void inject_unicode(const InputPacket *pkt)
         input_log("SendInput(UNICODE) failed: %lu", GetLastError());
 }
 
-static void inject_relative_mouse(const InputPacket *pkt)
+static void inject_relative_mouse(const InputPacket *packets, UINT count)
 {
-    INPUT inp = {0};
-    inp.type = INPUT_MOUSE;
-    inp.mi.dx = (LONG)(INT32)pkt->param1;
-    inp.mi.dy = (LONG)(INT32)pkt->param2;
-    inp.mi.dwFlags = MOUSEEVENTF_MOVE;
+    INPUT moves[INPUT_BATCH_PACKETS];
+    ZeroMemory(moves, count * sizeof(*moves));
+    for (UINT i = 0; i < count; ++i) {
+        moves[i].type = INPUT_MOUSE;
+        moves[i].mi.dx = (LONG)(INT32)packets[i].param1;
+        moves[i].mi.dy = (LONG)(INT32)packets[i].param2;
+        moves[i].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE;
+    }
     switch_to_input_desktop();
-    SendInput(1, &inp, sizeof(inp));
+    UINT sent = SendInput(count, moves, sizeof(*moves));
+    /* Keep the individual send attempts if Windows accepts only part of a batch. */
+    if (count > 1) {
+        for (; sent < count; ++sent)
+            SendInput(1, &moves[sent], sizeof(*moves));
+    }
 }
 
 static void inject_physical_key(const InputPacket *pkt, PhysicalKeyState *keys)
@@ -286,15 +310,17 @@ static BOOL disable_gamepads(AsbConn *c, AsbGuestGamepads *gamepads, UINT *versi
 
 static void handle_conn(AsbConn *c)
 {
-    InputPacket pkt;
+    InputPacket packets[INPUT_BATCH_PACKETS];
     PhysicalKeyState keys = {0};
     UINT keyboard_version = 1;
     UINT mouse_version = 0;
     UINT gamepad_version = 0;
     AsbGuestGamepads gamepads = {0};
-    UINT pkt_count = 0;
+    UINT total_packets = 0;
     UINT32 ready = INPUT_READY_MAGIC;
-    int received = 0;
+    UINT next_packet = 0, packet_count = 0;
+    const int packet_size = sizeof(InputPacket);
+    int partial_bytes = 0;
 
     /* Tell the host we're ready to receive input. */
     if (asb_send(c, &ready, sizeof(ready)) != (int)sizeof(ready)) {
@@ -309,30 +335,37 @@ static void handle_conn(AsbConn *c)
         if (gamepads.pending) {
             if (!asb_guest_gamepads_retry(&gamepads) && !disable_gamepads(c, &gamepads, &gamepad_version))
                 break;
-            if (gamepads.pending) {
+            if (gamepads.pending && next_packet == packet_count) {
                 int available = asb_poll(c, ASB_GAMEPAD_RETRY_MS);
                 if (available < 0) {
-                    input_log("Input connection closed while retrying gamepad reports after %u packets.", pkt_count);
+                    input_log("Input connection closed while retrying gamepad reports after %u packets.", total_packets);
                     break;
                 }
                 if (available == 0) continue;
             }
         }
-        int n = asb_recv(c, (char *)&pkt + received, (int)sizeof(pkt) - received);
-        if (n <= 0) {
-            input_log("%s after %u packets.",
-                       n == 0 ? "Host disconnected" : "recv error", pkt_count);
-            break;
+        if (next_packet == packet_count) {
+            if (partial_bytes && packet_count)
+                memmove(packets, packets + packet_count, partial_bytes);
+            int n = asb_recv(c, (char *)packets + partial_bytes, (int)sizeof(packets) - partial_bytes);
+            if (n <= 0) {
+                input_log("%s after %u packets.",
+                           n == 0 ? "Host disconnected" : "recv error", total_packets);
+                break;
+            }
+            int available = partial_bytes + n;
+            packet_count = (UINT)(available / packet_size);
+            partial_bytes = available % packet_size;
+            next_packet = 0;
+            if (!packet_count) continue;
         }
-        received += n;
-        if (received != (int)sizeof(pkt)) continue;
-        received = 0;
+        const InputPacket pkt = packets[next_packet++];
         if (pkt.magic != INPUT_MAGIC) {
             input_log("Bad magic 0x%08X, skipping.", pkt.magic);
             continue;
         }
-        pkt_count++;
-        if (pkt_count == 1)
+        total_packets++;
+        if (total_packets == 1)
             input_log("First packet: type=%u p1=%u p2=%u p3=%u",
                        pkt.type, pkt.param1, pkt.param2, pkt.param3);
         if (pkt.type == INPUT_MOUSE_QUERY) {
@@ -346,8 +379,17 @@ static void handle_conn(AsbConn *c)
                 break;
             mouse_version = reply.param1;
         } else if (pkt.type == INPUT_MOUSE_RELATIVE) {
-            if (mouse_version >= INPUT_MOUSE_VERSION && pkt.param3 == 0)
-                inject_relative_mouse(&pkt);
+            if (mouse_version >= INPUT_MOUSE_VERSION && pkt.param3 == 0) {
+                /* Batch only adjacent reports already received. Preserve each delta
+                   and process intervening clicks, keys and queries in wire order. */
+                UINT first = next_packet - 1;
+                while (next_packet < packet_count && packets[next_packet].magic == INPUT_MAGIC &&
+                       packets[next_packet].type == INPUT_MOUSE_RELATIVE && !packets[next_packet].param3)
+                    ++next_packet;
+                UINT count = next_packet - first;
+                total_packets += count - 1;
+                inject_relative_mouse(&packets[first], count);
+            }
         } else if (pkt.type == INPUT_MOUSE_POSITION_QUERY) {
             POINT point;
             InputPacket reply = {INPUT_MAGIC, INPUT_MOUSE_POSITION_REPLY,

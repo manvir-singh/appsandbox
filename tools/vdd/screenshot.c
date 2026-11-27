@@ -159,6 +159,7 @@ void asb_vdd_screenshot_frame(AsbVddScreenshot *s,ID3D11Texture2D *source,
         IDXGIKeyedMutex_AcquireSync(s->writerMutex,0,0)==S_OK) {
         ID3D11DeviceContext_CopyResource(s->pDeviceContext,
             (ID3D11Resource *)s->mirror,(ID3D11Resource *)source);
+        ID3D11DeviceContext_Flush(s->pDeviceContext);
         HRESULT hr=IDXGIKeyedMutex_ReleaseSync(s->writerMutex,1);
         if (SUCCEEDED(hr)) {
             s->screenshotReply.width=desc.Width;s->screenshotReply.height=desc.Height;

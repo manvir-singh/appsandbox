@@ -243,6 +243,7 @@ struct VmDisplayIdd {
     IDXGISwapChain          *swap_chain;
     DXGI_FORMAT              swap_format;
     UINT                    swap_flags;
+    UINT                    swap_width, swap_height;
     HANDLE                  present_event;
     BOOL                    present_ready;
     BOOL                    render_pending;
@@ -2339,6 +2340,8 @@ static BOOL d3d_init(VmDisplayIdd *d)
 
     d->swap_flags = scd.Flags;
     d->swap_format = scd.BufferDesc.Format;
+    d->swap_width = scd.BufferDesc.Width;
+    d->swap_height = scd.BufferDesc.Height;
 
     {
         IDXGISwapChain2 *swap = NULL;
@@ -2460,6 +2463,8 @@ static void d3d_resize_swap_chain(VmDisplayIdd *d, DXGI_FORMAT format)
         ui_log(L"IDD: ResizeBuffers failed (0x%08X)", hr);
         return;
     }
+    d->swap_width = (UINT)rc.right;
+    d->swap_height = (UINT)rc.bottom;
     if (format != DXGI_FORMAT_UNKNOWN && format != d->swap_format) {
         IDXGISwapChain3 *swap = NULL;
         DXGI_COLOR_SPACE_TYPE color_space = format == DXGI_FORMAT_R16G16B16A16_FLOAT
@@ -2615,7 +2620,10 @@ static void d3d_render_frame(VmDisplayIdd *d)
     }
     d->ctx->lpVtbl->OMSetRenderTargets(d->ctx, 1, &d->rtv, NULL);
     d->ctx->lpVtbl->RSSetViewports(d->ctx, 1, &vp);
-    d->ctx->lpVtbl->ClearRenderTargetView(d->ctx, d->rtv, clear_color);
+    /* The shared frame draw overwrites the entire target when there are no black bars. */
+    if (!shared || vp.TopLeftX != 0.0f || vp.TopLeftY != 0.0f ||
+        vp.Width != (float)d->swap_width || vp.Height != (float)d->swap_height)
+        d->ctx->lpVtbl->ClearRenderTargetView(d->ctx, d->rtv, clear_color);
 
     d->ctx->lpVtbl->IASetPrimitiveTopology(d->ctx,
             D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

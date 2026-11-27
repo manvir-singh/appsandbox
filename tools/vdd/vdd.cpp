@@ -1260,27 +1260,6 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
             VDD_GPU_SLOT* slot = &proc->gpuSlots[proc->screenshot.handoff.slot];
             asb_vdd_screenshot_handoff(&proc->screenshot, slot->pMutex, slot->pTexture, slot->sequence);
         }
-        if (proc->bGpuPoolReady && proc->bGpuPendingFrame) {
-            ID3D11Texture2D* pending = proc->pGpuPendingTex;
-            pending->AddRef();
-            if (!VddPublishGpuFrame(proc, pending)) {
-                if (proc->pStagingTex) {
-                    proc->pDeviceContext->CopyResource(proc->pStagingTex, pending);
-                    proc->pDeviceContext->Flush();
-                    bHasFrame = proc->pDevice->GetDeviceRemovedReason() == S_OK;
-                }
-                VddReleaseGpuTexture(proc, FALSE);
-                bSentFullFrame = FALSE;
-            }
-            pending->Release();
-        }
-        if (proc->bGpuPoolReady && !proc->bGpuHasFrame && bHasFrame) {
-            if (!VddPublishGpuFrame(proc, proc->pStagingTex)) {
-                VddReleaseGpuTexture(proc, FALSE);
-                bSentFullFrame = FALSE;
-            }
-        }
-
         /* Use v2 acquire when available */
 #pragma warning(suppress: 4127)
         if (IDD_IS_FUNCTION_AVAILABLE(IddCxSwapChainReleaseAndAcquireBuffer2)) {
@@ -1297,6 +1276,28 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
         }
 
         if (hr == E_PENDING) {
+            /* Give a new desktop frame the next slot when the viewer is behind.
+               Retry the cached frame here so a final update still reaches the viewer. */
+            if (proc->bGpuPoolReady && proc->bGpuPendingFrame) {
+                ID3D11Texture2D* pending = proc->pGpuPendingTex;
+                pending->AddRef();
+                if (!VddPublishGpuFrame(proc, pending)) {
+                    if (proc->pStagingTex) {
+                        proc->pDeviceContext->CopyResource(proc->pStagingTex, pending);
+                        proc->pDeviceContext->Flush();
+                        bHasFrame = proc->pDevice->GetDeviceRemovedReason() == S_OK;
+                    }
+                    VddReleaseGpuTexture(proc, FALSE);
+                    bSentFullFrame = FALSE;
+                }
+                pending->Release();
+            } else if (proc->bGpuPoolReady && !proc->bGpuHasFrame && bHasFrame) {
+                if (!VddPublishGpuFrame(proc, proc->pStagingTex)) {
+                    VddReleaseGpuTexture(proc, FALSE);
+                    bSentFullFrame = FALSE;
+                }
+            }
+
             VDD_GPU_SLOT* cached = &proc->gpuSlots[proc->gpuLastSlot];
             asb_vdd_screenshot_poll(&proc->screenshot, proc->pStagingTex,
                 proc->bGpuPendingFrame ? proc->pGpuPendingTex : NULL,
@@ -1485,7 +1486,6 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 VddLog("SwapChainRunCore: FinishedProcessingFrame FAILED hr=0x%08X, exiting for reassignment", hr);
                 break;
             }
-            if (proc->bGpuPoolReady) proc->pDeviceContext->Flush();
         } else {
             /* ACCESS_LOST can be transient (display mode change) — retry with
                exponential backoff up to MAX_RETRIES.  All other errors: exit

@@ -21,6 +21,8 @@ typedef struct {
     DWORD number;
     ULONGLONG size_bytes;
     BOOL read_only;
+    BOOL online;
+    BOOL safe_to_offline; /* Storage provider verified this is not a boot, system or clustered disk. */
 } PhysicalDisk;
 
 /* With an ID, report only the matching disk and reject ambiguous identities. */
@@ -28,6 +30,9 @@ typedef void (*PhysicalDiskVisitor)(const PhysicalDisk *disk, void *context);
 HRESULT physical_disk_enum(const wchar_t *id, PhysicalDiskVisitor visit, void *context);
 HRESULT physical_disk_resolve(const wchar_t *id, PhysicalDisk *disk);
 HRESULT physical_disk_make_writable(const PhysicalDisk *disk);
+typedef enum { HOST_DISK_QUERY, HOST_DISK_MOUNT, HOST_DISK_UNMOUNT } HostDiskAction;
+HRESULT physical_disk_host_mount(const wchar_t *id, HostDiskAction action, BOOL *mounted);
+HRESULT vhdx_host_mount(const wchar_t *path, HostDiskAction action, BOOL read_only, BOOL *mounted);
 
 /* Create a new dynamically-expanding VHDX file.
    size_gb: maximum virtual size in gigabytes. */

@@ -4165,6 +4165,77 @@ ASB_API HRESULT asb_vm_create_on_physical_disk(const AsbVmConfig *config, AsbVmI
     return create_vm(config, created_id, edid, disk_id);
 }
 
+/* ---- Host disk mounting ---- */
+
+static HRESULT query_host_disk(VmInstance *vm, BOOL *mounted)
+{
+    if (vm->physical_disk_id[0])
+        return physical_disk_host_mount(vm->physical_disk_id, HOST_DISK_QUERY, mounted);
+    return vhdx_host_mount(vm->vhdx_path, HOST_DISK_QUERY, TRUE, mounted);
+}
+
+static BOOL host_disk_absent(HRESULT hr)
+{
+    return hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || hr == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND) ||
+           hr == HRESULT_FROM_WIN32(ERROR_NOT_READY) || hr == HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED);
+}
+
+ASB_API BOOL asb_vm_host_disk_mounted(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    if (!inst || inst->running || inst->starting || inst->building_vhdx || inst->is_template) return FALSE;
+    /* The list can refresh on every build progress event from another VM.
+       Commands always recheck Windows before changing disk ownership. */
+    if (GetTickCount64() >= inst->host_disk_check_after) {
+        BOOL mounted = FALSE;
+        inst->host_disk_check_after = GetTickCount64() + 2000;
+        HRESULT hr = query_host_disk(inst, &mounted);
+        if (SUCCEEDED(hr) || host_disk_absent(hr)) inst->host_disk_mounted = mounted;
+    }
+    return inst->host_disk_mounted;
+}
+
+ASB_API HRESULT asb_vm_set_host_disk_mounted(AsbVm vm, BOOL mounted)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0) return E_INVALIDARG;
+    VmInstance *inst = &VM_AT(idx);
+    if (inst->running || inst->starting || inst->building_vhdx || inst->is_template)
+        return HRESULT_FROM_WIN32(ERROR_BUSY);
+    BOOL actual = inst->host_disk_mounted;
+    HostDiskAction action = mounted ? HOST_DISK_MOUNT : HOST_DISK_UNMOUNT;
+    HRESULT hr;
+    if (inst->physical_disk_id[0]) {
+        hr = physical_disk_host_mount(inst->physical_disk_id, action, &actual);
+    } else {
+        SnapshotTree *tree = &SNAP_AT(idx);
+        int snap, branch;
+        snapshot_find_current(tree, inst->vhdx_path, &snap, &branch);
+        BOOL frozen = (tree->count || tree->base_branch_count) && branch < 0;
+        hr = vhdx_host_mount(inst->vhdx_path, action, frozen, &actual);
+    }
+    inst->host_disk_mounted = actual;
+    inst->host_disk_check_after = 0;
+    asb_events_changed();
+    return hr;
+}
+
+static HRESULT require_unmounted_disk(VmInstance *vm)
+{
+    if (vm->running || vm->is_template) return S_OK;
+    BOOL mounted = FALSE;
+    HRESULT hr = query_host_disk(vm, &mounted);
+    /* An absent disk has no host mount. Normal start/delete validation
+       still applies, including removal of disconnected disk assignments. */
+    if (host_disk_absent(hr)) return S_OK;
+    if (FAILED(hr)) return hr;
+    if (mounted) {
+        asb_log(L"Unmount the host disk for \"%s\" before continuing.", vm->name);
+        return HRESULT_FROM_WIN32(ERROR_BUSY);
+    }
+    return S_OK;
+}
+
 /* ---- VM Start ---- */
 
 ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
@@ -4183,6 +4254,8 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
     SnapshotTree *tree = &SNAP_AT(idx);
 
     if (inst->running) { asb_log(L"VM \"%s\" is already running.", inst->name); return S_FALSE; }
+    HRESULT disk_status = require_unmounted_disk(inst);
+    if (FAILED(disk_status)) return disk_status;
     inst->display_suppressed = FALSE;
     if (resolve_vm_gpu_selection(inst)) save_vm_list();
     if (inst->network_mode != NET_NONE) {
@@ -4385,6 +4458,8 @@ static HRESULT delete_instance(AsbVm vm,BOOL template_resource)
     inst = &VM_AT(idx);
     if (!!inst->is_template!=!!template_resource) return E_INVALIDARG;
     if (inst->building_vhdx || inst->starting) return E_ACCESSDENIED;
+    hr = require_unmounted_disk(inst);
+    if (FAILED(hr)) return hr;
     if (inst->start_thread) WaitForSingleObject(inst->start_thread, INFINITE);
     if (!get_vm_disk_root(inst->vhdx_path, dir)) return E_INVALIDARG;
     attrs = GetFileAttributesW(dir);
@@ -4665,6 +4740,8 @@ ASB_API HRESULT asb_vm_set_disk_size(AsbVm vm, DWORD hdd_gb)
     refresh_disk_size(inst->vhdx_path, &inst->hdd_gb);
     if (!hdd_gb || hdd_gb > INT_MAX || hdd_gb < inst->hdd_gb) return E_INVALIDARG;
     if (hdd_gb == inst->hdd_gb) return S_FALSE;
+    HRESULT disk_status = require_unmounted_disk(inst);
+    if (FAILED(disk_status)) return disk_status;
     if (SNAP_AT(idx).count || SNAP_AT(idx).base_branch_count)
         return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     if (!inst->disk_resize_supported)
@@ -4749,6 +4826,8 @@ ASB_API HRESULT asb_snap_take(AsbVm vm, const wchar_t *name)
     if (VM_AT(idx).physical_disk_id[0]) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
     if (VM_AT(idx).running) { asb_log(L"VM must be stopped to take a snapshot."); return E_ACCESSDENIED; }
+    hr = require_unmounted_disk(&VM_AT(idx));
+    if (FAILED(hr)) return hr;
 
     if (name && name[0] != L'\0')
         wcscpy_s(snap_name, 128, name);
@@ -4774,6 +4853,8 @@ ASB_API HRESULT asb_snap_delete(AsbVm vm, int snap_idx)
     if (idx < 0) return E_INVALIDARG;
     if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
     if (snap_idx < 0) { asb_log(L"Select a snapshot to delete."); return E_INVALIDARG; }
+    hr = require_unmounted_disk(&VM_AT(idx));
+    if (FAILED(hr)) return hr;
 
     asb_log(L"Deleting snapshot %d...", snap_idx);
     hr = snapshot_delete(&SNAP_AT(idx), &VM_AT(idx), snap_idx);
@@ -4792,6 +4873,8 @@ ASB_API HRESULT asb_snap_new_branch(AsbVm vm, int snap_idx)
     if (idx < 0) return E_INVALIDARG;
     if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
 
+    hr = require_unmounted_disk(&VM_AT(idx));
+    if (FAILED(hr)) return hr;
     hr = snapshot_new_branch(&SNAP_AT(idx), &VM_AT(idx), snap_idx);
     if (FAILED(hr)) asb_log(L"Error: Failed to create branch (0x%08X)", hr);
 
@@ -4807,6 +4890,8 @@ ASB_API HRESULT asb_snap_delete_branch(AsbVm vm, int snap_idx, int branch_idx)
     if (idx < 0) return E_INVALIDARG;
     if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
 
+    hr = require_unmounted_disk(&VM_AT(idx));
+    if (FAILED(hr)) return hr;
     asb_log(L"Deleting branch %d of %s...", branch_idx,
             snap_idx == -2 ? L"base"
               : (snap_idx >= 0 && snap_idx < SNAP_AT(idx).count

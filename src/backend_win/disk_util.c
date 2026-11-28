@@ -66,10 +66,15 @@ static BOOL disk_string(IWbemClassObject *object, const wchar_t *key,
     return valid;
 }
 
-static BOOL disk_flag_set(IWbemClassObject *object, const wchar_t *key)
+static BOOL disk_flag(IWbemClassObject *object, const wchar_t *key, BOOL *known)
 {
     VARIANT value;
-    if (!disk_property(object, key, VT_BOOL, &value)) return FALSE;
+    VariantInit(&value);
+    if (FAILED(object->lpVtbl->Get(object, key, 0, &value, NULL, NULL)) || value.vt != VT_BOOL) {
+        VariantClear(&value);
+        *known = FALSE;
+        return FALSE;
+    }
     BOOL set = value.boolVal != VARIANT_FALSE;
     VariantClear(&value);
     return set;
@@ -126,17 +131,20 @@ static void load_disk_metadata(PhysicalDisk *disks, size_t disk_count)
         for (size_t i = 0; i < disk_count; i++) {
             PhysicalDisk *disk = &disks[i];
             if (number != disk->number) continue;
+            BOOL known = TRUE;
             if (unsupported_disk_bus(disk_uint(row, L"BusType", BusTypeUnknown)) ||
-                disk_flag_set(row, L"IsBoot") || disk_flag_set(row, L"IsSystem") ||
-                disk_flag_set(row, L"IsClustered")) {
+                disk_flag(row, L"IsBoot", &known) || disk_flag(row, L"IsSystem", &known) ||
+                disk_flag(row, L"IsClustered", &known)) {
                 disk->path[0] = L'\0';
                 continue;
             }
             if (!disk->size_bytes) disk->size_bytes = disk_uint(row, L"Size", 0);
             disk_string(row, L"FriendlyName", disk->name, ARRAYSIZE(disk->name));
             wchar_t path[MAX_PATH];
-            if (disk_string(row, L"Path", path, ARRAYSIZE(path)) && _wcsicmp(path, disk->path) == 0)
+            if (disk_string(row, L"Path", path, ARRAYSIZE(path)) && _wcsicmp(path, disk->path) == 0) {
                 disk_string(row, L"UniqueId", disk->legacy_id, ARRAYSIZE(disk->legacy_id));
+                disk->safe_to_offline = known;
+            }
         }
         row->lpVtbl->Release(row);
     }
@@ -187,9 +195,8 @@ static HRESULT get_offline_disk_number(HANDLE device, DWORD *disk_number, BOOL *
     if (!DeviceIoControl(device, IOCTL_DISK_GET_DISK_ATTRIBUTES, NULL, 0,
                          &attrs, sizeof(attrs), &bytes, NULL)) return HRESULT_FROM_WIN32(GetLastError());
     if (bytes < sizeof(attrs)) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
-    if (!(attrs.Attributes & DISK_ATTRIBUTE_OFFLINE)) return S_FALSE;
     *read_only = (attrs.Attributes & DISK_ATTRIBUTE_READ_ONLY) != 0;
-    return S_OK;
+    return (attrs.Attributes & DISK_ATTRIBUTE_OFFLINE) ? S_OK : S_FALSE;
 }
 
 static BOOL get_disk_hardware_id(HANDLE device, DWORD number, wchar_t id[MAX_PATH])
@@ -210,7 +217,7 @@ static BOOL get_disk_hardware_id(HANDLE device, DWORD number, wchar_t id[MAX_PAT
     return swprintf_s(id, MAX_PATH, L"device:%s", guid) > 0;
 }
 
-static BOOL read_offline_disk(HANDLE device, const wchar_t *path, PhysicalDisk *disk)
+static BOOL read_physical_disk(HANDLE device, const wchar_t *path, PhysicalDisk *disk)
 {
     DWORD bytes;
     STORAGE_PROPERTY_QUERY query = {0};
@@ -236,12 +243,12 @@ static BOOL read_offline_disk(HANDLE device, const wchar_t *path, PhysicalDisk *
         bytes >= FIELD_OFFSET(DISK_GEOMETRY_EX, Data) && geometry.DiskSize.QuadPart > 0)
         disk->size_bytes = (ULONGLONG)geometry.DiskSize.QuadPart;
 
-    get_disk_hardware_id(device, disk->number, disk->id);
     wcscpy_s(disk->path, ARRAYSIZE(disk->path), path);
     return TRUE;
 }
 
-HRESULT physical_disk_enum(const wchar_t *id, PhysicalDiskVisitor visit, void *context)
+static HRESULT enum_physical_disks(const wchar_t *id, PhysicalDiskVisitor visit, void *context,
+                                   BOOL include_online, BOOL metadata)
 {
     wchar_t *paths = NULL;
     HRESULT hr = list_disk_interfaces(&paths);
@@ -255,6 +262,7 @@ HRESULT physical_disk_enum(const wchar_t *id, PhysicalDiskVisitor visit, void *c
         return E_OUTOFMEMORY;
     }
     size_t count = 0;
+    BOOL by_hardware_id = id && _wcsnicmp(id, L"device:", 7) == 0;
     for (const wchar_t *path = paths; *path; path += wcslen(path) + 1) {
         if (wcslen(path) >= MAX_PATH) continue;
         HANDLE device = CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -263,20 +271,25 @@ HRESULT physical_disk_enum(const wchar_t *id, PhysicalDiskVisitor visit, void *c
         PhysicalDisk disk = {0};
         disk.number = MAXDWORD;
         HRESULT status = get_offline_disk_number(device, &disk.number, &disk.read_only);
-        if (status == S_OK && read_offline_disk(device, path, &disk)) disks[count++] = disk;
-        else if (!id && FAILED(status) && disk.number != MAXDWORD)
+        if (status == S_OK || (include_online && status == S_FALSE)) {
+            get_disk_hardware_id(device, disk.number, disk.id);
+            if ((!by_hardware_id || _wcsicmp(id, disk.id) == 0) && read_physical_disk(device, path, &disk)) {
+                disk.online = status == S_FALSE;
+                disks[count++] = disk;
+            }
+        } else if (!id && FAILED(status) && disk.number != MAXDWORD)
             ui_log(L"Disk %lu is unavailable for passthrough (0x%08X).", disk.number, status);
         CloseHandle(device);
     }
     free(paths);
 
-    if (count) load_disk_metadata(disks, count);
+    if (count && metadata) load_disk_metadata(disks, count);
     PhysicalDisk *selected = NULL;
     for (size_t i = 0; i < count; i++) {
         PhysicalDisk *disk = &disks[i];
         if (!disk->path[0]) continue;
         if (!disk->id[0]) wcscpy_s(disk->id, ARRAYSIZE(disk->id), disk->legacy_id);
-        if (!disk->id[0] || !disk->size_bytes) {
+        if (!disk->id[0] || (!include_online && !disk->size_bytes)) {
             if (!id) ui_log(L"Disk %lu is offline, but Windows did not report %s.", disk->number,
                             disk->id[0] ? L"its capacity" : L"a persistent device ID");
             continue;
@@ -296,6 +309,11 @@ HRESULT physical_disk_enum(const wchar_t *id, PhysicalDiskVisitor visit, void *c
     }
     free(disks);
     return hr;
+}
+
+HRESULT physical_disk_enum(const wchar_t *id, PhysicalDiskVisitor visit, void *context)
+{
+    return enum_physical_disks(id, visit, context, FALSE, TRUE);
 }
 
 static void copy_physical_disk(const PhysicalDisk *disk, void *context)
@@ -357,6 +375,244 @@ HRESULT physical_disk_make_writable(const PhysicalDisk *disk)
         }
     }
     CloseHandle(device);
+    return hr;
+}
+
+typedef struct VolumeLock {
+    HANDLE handle;
+    struct VolumeLock *next;
+} VolumeLock;
+
+static void release_volume_locks(VolumeLock *locks)
+{
+    while (locks) {
+        VolumeLock *next = locks->next;
+        CloseHandle(locks->handle);
+        free(locks);
+        locks = next;
+    }
+}
+
+/* Check every extent, including volumes without a drive letter. */
+static DWORD volume_on_disk(HANDLE volume, DWORD number, BOOL *match)
+{
+    DWORD size = sizeof(VOLUME_DISK_EXTENTS), bytes;
+    *match = FALSE;
+    for (;;) {
+        VOLUME_DISK_EXTENTS *ext = malloc(size);
+        if (!ext) return ERROR_OUTOFMEMORY;
+        BOOL ok = DeviceIoControl(volume, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, NULL, 0,
+                                  ext, size, &bytes, NULL);
+        DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+        if (ok) {
+            size_t offset = FIELD_OFFSET(VOLUME_DISK_EXTENTS, Extents);
+            if (bytes < offset || ext->NumberOfDiskExtents > (bytes - offset) / sizeof(DISK_EXTENT))
+                error = ERROR_INVALID_DATA;
+            else {
+                BOOL other_disk = FALSE;
+                for (DWORD i = 0; i < ext->NumberOfDiskExtents; ++i) {
+                    if (ext->Extents[i].DiskNumber == number) *match = TRUE;
+                    else other_disk = TRUE;
+                }
+                if (*match && other_disk) error = ERROR_NOT_SUPPORTED;
+            }
+        }
+        free(ext);
+        if (error != ERROR_MORE_DATA) {
+            if (error == ERROR_INVALID_FUNCTION || (error == ERROR_NOT_SUPPORTED && !*match) ||
+                error == ERROR_NOT_READY || error == ERROR_NO_MEDIA_IN_DRIVE) return ERROR_SUCCESS;
+            return error;
+        }
+        if (size > MAXDWORD / 2) return ERROR_ARITHMETIC_OVERFLOW;
+        size *= 2;
+    }
+}
+
+static HRESULT lock_disk_volumes(DWORD number, VolumeLock **locks)
+{
+    wchar_t name[MAX_PATH];
+    HANDLE search = FindFirstVolumeW(name, ARRAYSIZE(name));
+    if (search == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+    DWORD error = ERROR_SUCCESS;
+    do {
+        size_t len = wcslen(name);
+        if (!len || name[len - 1] != L'\\') { error = ERROR_INVALID_NAME; break; }
+        name[len - 1] = L'\0';
+        HANDLE volume = CreateFileW(name, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                    OPEN_EXISTING, 0, NULL);
+        if (volume == INVALID_HANDLE_VALUE) {
+            error = GetLastError();
+            if (error == ERROR_FILE_NOT_FOUND || error == ERROR_NOT_READY) {
+                error = ERROR_SUCCESS;
+                continue;
+            }
+            break;
+        }
+        BOOL match;
+        error = volume_on_disk(volume, number, &match);
+        CloseHandle(volume);
+        if (error) break;
+        if (match) {
+            volume = CreateFileW(name, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 NULL, OPEN_EXISTING, 0, NULL);
+            if (volume == INVALID_HANDLE_VALUE) { error = GetLastError(); break; }
+            DWORD bytes;
+            /* A successful lock flushes the filesystem and excludes open files. */
+            if (!DeviceIoControl(volume, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0, &bytes, NULL)) {
+                error = GetLastError();
+                if (error == ERROR_ACCESS_DENIED) error = ERROR_SHARING_VIOLATION;
+            } else {
+                VolumeLock *lock = malloc(sizeof(*lock));
+                if (!lock) error = ERROR_OUTOFMEMORY;
+                else {
+                    lock->handle = volume;
+                    lock->next = *locks;
+                    *locks = lock;
+                    volume = INVALID_HANDLE_VALUE;
+                }
+            }
+            if (volume != INVALID_HANDLE_VALUE) CloseHandle(volume);
+        }
+        if (error) break;
+    } while (FindNextVolumeW(search, name, ARRAYSIZE(name)));
+    if (!error) {
+        error = GetLastError();
+        if (error == ERROR_NO_MORE_FILES) error = ERROR_SUCCESS;
+    }
+    FindVolumeClose(search);
+    return HRESULT_FROM_WIN32(error);
+}
+
+HRESULT physical_disk_host_mount(const wchar_t *id, HostDiskAction action, BOOL *mounted)
+{
+    PhysicalDisk disk = {0};
+    BOOL desired = action == HOST_DISK_MOUNT;
+    BOOL hardware_id = _wcsnicmp(id, L"device:", 7) == 0;
+    HRESULT hr = enum_physical_disks(id, copy_physical_disk, &disk, TRUE, action != HOST_DISK_QUERY || !hardware_id);
+    if (FAILED(hr)) return hr;
+    *mounted = disk.online;
+    if (action == HOST_DISK_QUERY || disk.online == desired) return S_OK;
+    if (!desired && !disk.safe_to_offline) return E_ACCESSDENIED;
+
+    HANDLE device = CreateFileW(disk.path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                NULL, OPEN_EXISTING, 0, NULL);
+    if (device == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+    DWORD number, bytes;
+    BOOL read_only;
+    VolumeLock *locks = NULL;
+    hr = get_offline_disk_number(device, &number, &read_only);
+    if (FAILED(hr)) goto done;
+    *mounted = hr == S_FALSE;
+    if (number != disk.number) { hr = HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED); goto done; }
+    if (_wcsnicmp(disk.id, L"device:", 7) == 0) {
+        wchar_t actual[MAX_PATH];
+        if (!get_disk_hardware_id(device, number, actual) || _wcsicmp(actual, disk.id)) {
+            hr = HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED); goto done;
+        }
+    } else {
+        /* Revalidate legacy provider identities with the device handle held. */
+        PhysicalDisk current = {0};
+        hr = enum_physical_disks(id, copy_physical_disk, &current, TRUE, TRUE);
+        if (FAILED(hr)) goto done;
+        if (current.number != number || _wcsicmp(current.path, disk.path) ||
+            (!desired && !current.safe_to_offline)) { hr = E_ACCESSDENIED; goto done; }
+    }
+    if (*mounted == desired) { hr = S_OK; goto done; }
+    if (!desired) {
+        hr = lock_disk_volumes(number, &locks);
+        if (FAILED(hr)) goto done;
+    }
+    SET_DISK_ATTRIBUTES attrs = {0};
+    attrs.Version = sizeof(attrs);
+    attrs.Persist = TRUE;
+    attrs.AttributesMask = DISK_ATTRIBUTE_OFFLINE;
+    attrs.Attributes = desired ? 0 : DISK_ATTRIBUTE_OFFLINE;
+    if (!DeviceIoControl(device, IOCTL_DISK_SET_DISK_ATTRIBUTES, &attrs, sizeof(attrs),
+                         NULL, 0, &bytes, NULL)) hr = HRESULT_FROM_WIN32(GetLastError());
+    else {
+        DeviceIoControl(device, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &bytes, NULL);
+        hr = get_offline_disk_number(device, &number, &read_only);
+        if (SUCCEEDED(hr)) {
+            *mounted = hr == S_FALSE;
+            hr = *mounted == desired ? S_OK : HRESULT_FROM_WIN32(ERROR_NOT_READY);
+        }
+    }
+done:
+    release_volume_locks(locks);
+    CloseHandle(device);
+    return hr;
+}
+
+static HRESULT lock_vhdx_volumes(HANDLE disk, VolumeLock **locks)
+{
+    wchar_t path[MAX_PATH];
+    ULONG length = sizeof(path);
+    DWORD error = GetVirtualDiskPhysicalPath(disk, &length, path);
+    if (error) return HRESULT_FROM_WIN32(error);
+    HANDLE device = CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (device == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+    STORAGE_DEVICE_NUMBER number;
+    DWORD bytes;
+    HRESULT hr;
+    if (!DeviceIoControl(device, IOCTL_STORAGE_GET_DEVICE_NUMBER, NULL, 0, &number,
+                         sizeof(number), &bytes, NULL)) hr = HRESULT_FROM_WIN32(GetLastError());
+    else if (bytes < sizeof(number) || number.DeviceType != FILE_DEVICE_DISK || number.DeviceNumber == MAXDWORD)
+        hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    else hr = lock_disk_volumes(number.DeviceNumber, locks);
+    CloseHandle(device);
+    return hr;
+}
+
+static DWORD open_host_vhdx(const wchar_t *path, BOOL info_only, BOOL read_only, HANDLE *disk)
+{
+    VIRTUAL_STORAGE_TYPE type = { VIRTUAL_STORAGE_TYPE_DEVICE_VHDX, VHDX_VENDOR_MS };
+    OPEN_VIRTUAL_DISK_PARAMETERS open = {0};
+    open.Version = OPEN_VIRTUAL_DISK_VERSION_2;
+    open.Version2.GetInfoOnly = info_only;
+    open.Version2.ReadOnly = read_only;
+    return OpenVirtualDisk(&type, path, VIRTUAL_DISK_ACCESS_NONE, OPEN_VIRTUAL_DISK_FLAG_NONE, &open, disk);
+}
+
+static HRESULT vhdx_is_mounted(const wchar_t *path, BOOL *mounted)
+{
+    HANDLE disk;
+    DWORD error = open_host_vhdx(path, TRUE, TRUE, &disk);
+    if (error) return HRESULT_FROM_WIN32(error);
+    GET_VIRTUAL_DISK_INFO info = {0};
+    info.Version = GET_VIRTUAL_DISK_INFO_IS_LOADED;
+    ULONG size = sizeof(info);
+    error = GetVirtualDiskInformation(disk, &size, &info, NULL);
+    if (!error) *mounted = info.IsLoaded;
+    CloseHandle(disk);
+    return HRESULT_FROM_WIN32(error);
+}
+
+HRESULT vhdx_host_mount(const wchar_t *path, HostDiskAction action, BOOL read_only, BOOL *mounted)
+{
+    BOOL desired = action == HOST_DISK_MOUNT;
+    HRESULT hr = vhdx_is_mounted(path, mounted);
+    if (FAILED(hr) || action == HOST_DISK_QUERY || *mounted == desired) return hr;
+
+    HANDLE disk;
+    DWORD error = open_host_vhdx(path, FALSE, read_only, &disk);
+    if (error) return HRESULT_FROM_WIN32(error);
+    VolumeLock *locks = NULL;
+    if (desired) {
+        ATTACH_VIRTUAL_DISK_PARAMETERS attach = {0};
+        attach.Version = ATTACH_VIRTUAL_DISK_VERSION_1;
+        ATTACH_VIRTUAL_DISK_FLAG flags = ATTACH_VIRTUAL_DISK_FLAG_PERMANENT_LIFETIME;
+        if (read_only) flags |= ATTACH_VIRTUAL_DISK_FLAG_READ_ONLY;
+        hr = HRESULT_FROM_WIN32(AttachVirtualDisk(disk, NULL, flags, 0, &attach, NULL));
+    } else {
+        hr = lock_vhdx_volumes(disk, &locks);
+        if (SUCCEEDED(hr)) hr = HRESULT_FROM_WIN32(DetachVirtualDisk(disk, DETACH_VIRTUAL_DISK_FLAG_NONE, 0));
+    }
+    release_volume_locks(locks);
+    CloseHandle(disk);
+    if (SUCCEEDED(hr)) {
+        hr = vhdx_is_mounted(path, mounted);
+        if (SUCCEEDED(hr) && *mounted != desired) hr = HRESULT_FROM_WIN32(ERROR_BUSY);
+    }
     return hr;
 }
 

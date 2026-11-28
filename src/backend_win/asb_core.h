@@ -153,6 +153,8 @@ typedef void (*AsbPhysicalDiskVisitor)(const wchar_t *id, const wchar_t *name,
                                        DWORD number, DWORD size_gb, BOOL read_only, void *context);
 ASB_API HRESULT asb_enum_physical_disks(AsbPhysicalDiskVisitor visit, void *context);
 ASB_API HRESULT asb_make_physical_disk_writable(const wchar_t *id);
+ASB_API BOOL asb_vm_host_disk_mounted(AsbVm vm);
+ASB_API HRESULT asb_vm_set_host_disk_mounted(AsbVm vm, BOOL mounted);
 
 ASB_API const wchar_t *asb_validate_disk_directory(const wchar_t *name,
     const wchar_t *disk_directory, BOOL is_template);

@@ -1156,6 +1156,9 @@ function updateStatusCell(td, vm) {
     } else if (vm.running) {
         className = 'status-running';
         label = 'Running';
+    } else if (vm.hostDiskMounted) {
+        className = 'status-stopped';
+        label = 'Disk mounted on host';
     } else {
         className = 'status-stopped';
         label = 'Stopped';
@@ -1241,14 +1244,26 @@ function buildRowCells(vm, i, statusTd) {
     ];
     if (!hostBridge.isMac) cells.push(makeSnapCell(vm, i));
     cells.push(
-        makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, function() { onStartVm(vmIndexById(vm.id)); }, '', vm.physicalDisk ? 'Boot from the physical disk' : 'Start the VM (boots from the selected snapshot/branch)'),
+        makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld && !vm.hostDiskMounted, function() { onStartVm(vmIndexById(vm.id)); }, '', vm.hostDiskMounted ? 'Unmount the disk before starting the VM' : vm.physicalDisk ? 'Boot from the physical disk' : 'Start the VM (boots from the selected snapshot/branch)'),
         makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmId: vm.id}); }, '', 'Open the VM display'),
         sshCell,
         makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmId: vm.id}); }, '', 'Request a graceful shutdown from the guest OS'),
         makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(vmIndexById(vm.id)); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
-        makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(vmIndexById(vm.id)); }, vm.running ? 'running' : '', vm.physicalDisk ? 'Delete this VM and release its disk assignment' : 'Delete this VM and its virtual disks'),
+        makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld && !vm.hostDiskMounted, function() { onDeleteVm(vmIndexById(vm.id)); }, vm.running ? 'running' : '', vm.hostDiskMounted ? 'Unmount the disk before deleting the VM' : vm.physicalDisk ? 'Delete this VM and release its disk assignment' : 'Delete this VM and its virtual disks'),
         makeIconCell('edit', '\u270F\uFE0F', canEditVm(vm), function() { openEditVmModal(vmIndexById(vm.id)); }, '', 'Edit VM configuration — VM must be stopped and fully installed'),
     );
+    if (!hostBridge.isMac) {
+        var mounted = !!vm.hostDiskMounted;
+        var label = mounted ? 'Unmount disk from host' : 'Mount disk on host';
+        var enabled = !vm.running && !bld && !vm.isTemplate;
+        var detail = vm.isTemplate ? 'Unavailable for templates' : !enabled ? 'Stop the VM first' :
+            vm.physicalDisk ? 'Assigned physical disk' : 'Current VM disk (VHDX)';
+        var cell = makeIconCell('mount', mounted ? '\u23CF' : '\uD83D\uDCBD', enabled, function() {
+            sendCmd(mounted ? 'unmountVmDisk' : 'mountVmDisk', {vmId: vm.id});
+        }, '', label + ' — ' + detail);
+        cell.querySelector('button').setAttribute('aria-label', label);
+        cells.push(cell);
+    }
     return cells;
 }
 
@@ -1263,7 +1278,7 @@ function renderVmTable() {
         tbody.innerHTML = '';
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = hostBridge.isMac ? 16 : 17;
+        td.colSpan = hostBridge.isMac ? 16 : 18;
         td.className = 'empty-state';
         var btn = document.createElement('button');
         btn.className = 'primary empty-state-btn';
@@ -1312,7 +1327,7 @@ function renderVmTable() {
             i, i === selectedVm, vm.name,
             vm.running, vm.starting, vm.buildingVhdx, vm.shuttingDown, vm.agentOnline,
             vm.agentVersion,
-            vm.installComplete, vm.isTemplate, vm.physicalDisk,
+            vm.installComplete, vm.isTemplate, vm.physicalDisk, vm.hostDiskMounted,
             vm.sshEnabled, vm.sshState, vm.sshPort,
             vm.osType, vm.osName, vm.ramMb, vm.hddGb, vm.cpuCores,
             vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode,
@@ -1516,6 +1531,7 @@ function updateEditVmModal() {
         el.disabled = !!disabled;
     });
     var diskError = vm.physicalDisk ? 'Physical disks have a fixed capacity.' :
+        vm.hostDiskMounted ? 'Unmount the disk before changing its size.' :
         vm.hasSnapshots ? 'Disk growth requires a VM without snapshots or branches.' : vm.diskResizeAgentError;
     disk.disabled = disabled || !!diskError;
     disk.parentElement.title = diskError || '';
@@ -1770,7 +1786,7 @@ function renderSnapshotModal() {
     if (!vm) { closeSnapshotModal(); return; }
     document.getElementById("snapshot-title").textContent = "Snapshots — " + vm.name;
     var value = selectedSnap.get(vm.id) || 'current';
-    var disabled = !!(vm.running || vm.buildingVhdx);
+    var disabled = !!(vm.running || vm.buildingVhdx || vm.hostDiskMounted);
     var treeSignature = snapshotTreeSignature(vm);
     if (treeSignature !== snapshotModal.treeSignature) {
         snapshotModal.currentRow = snapshotRowValue(vm, value);
@@ -1859,7 +1875,7 @@ function renderSnapshotModal() {
 function snapshotActionContext() {
     if (!snapshotModal) return null;
     var vm = vms[vmIndexById(snapshotModal.id)];
-    if (!vm || vm.running || vm.buildingVhdx) return null;
+    if (!vm || vm.running || vm.buildingVhdx || vm.hostDiskMounted) return null;
     return { modal: snapshotModal, id: vm.id, name: vm.name, value: selectedSnap.get(vm.id) || 'current',
         tree: snapshotTreeSignature(vm), vm: vm };
 }
@@ -1868,7 +1884,7 @@ function snapshotActionIndex(context) {
     if (snapshotModal !== context.modal) return -1;
     var idx = vmIndexById(context.id);
     var vm = vms[idx];
-    if (!vm || vm.running || vm.buildingVhdx) return -1;
+    if (!vm || vm.running || vm.buildingVhdx || vm.hostDiskMounted) return -1;
     if (context.tree !== snapshotTreeSignature(vm)) {
         document.getElementById('snapshot-warn').textContent = 'Snapshots changed. Select the disk again.';
         return -1;
@@ -1929,7 +1945,7 @@ function deleteSnapshot() {
 
 function onStartVm(idx) {
     var vm = vms[idx];
-    if (!vm || vm.running || vm.buildingVhdx) return;
+    if (!vm || vm.running || vm.buildingVhdx || vm.hostDiskMounted) return;
     var id = vm.id;
     var p = parseSnapValue(selectedSnap.get(id) || 'current');
     if ((p.snapIndex >= 0 || p.snapIndex === -2) && p.branchIndex < 0) {
@@ -1944,7 +1960,7 @@ function onStartVm(idx) {
             if (result === false) return;
             var currentIdx = vmIndexById(id);
             var current = vms[currentIdx];
-            if (!current || current.running || current.buildingVhdx) return;
+            if (!current || current.running || current.buildingVhdx || current.hostDiskMounted) return;
             if (tree !== snapshotTreeSignature(current)) {
                 showModal('Snapshots Changed', 'Select the disk again before starting the VM.', 'OK', { confirmClass: 'primary' });
                 return;

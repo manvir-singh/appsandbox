@@ -22,6 +22,7 @@
 #include "monitor_edid.h"
 #include "prereq.h"
 #include <dwmapi.h>
+#include <dbt.h>
 #include <commdlg.h>
 #include <commctrl.h>
 #include <stdio.h>
@@ -333,6 +334,7 @@ static void build_vm_json(JsonBuilder *jb, int i)
     asb_vm_disk_directory(asb_vm_get(i), disk_directory, MAX_PATH);
     jb_string(jb, L"diskDirectory", disk_directory);
     jb_bool(jb, L"physicalDisk", v->physical_disk_id[0] != L'\0');
+    jb_bool(jb, L"hostDiskMounted", asb_vm_host_disk_mounted((AsbVm)v));
     jb_bool(jb, L"running", v->running);
     jb_bool(jb, L"starting", v->starting);
     jb_bool(jb, L"shuttingDown", v->shutdown_requested);
@@ -1287,6 +1289,27 @@ static void handle_webview2_message(const wchar_t *json)
             if (vm && vm->running && !vm->install_complete) do_connect_vm(asb_vm_index((AsbVm)vm));
         }
         send_vm_list();
+    } else if (wcscmp(action, L"mountVmDisk") == 0 || wcscmp(action, L"unmountVmDisk") == 0) {
+        int idx;
+        if (json_vm_index(json, &idx)) {
+            BOOL mount = wcscmp(action, L"mountVmDisk") == 0;
+            AsbVm vm = asb_vm_get(idx);
+            HRESULT hr = asb_vm_set_host_disk_mounted(vm, mount);
+            if (FAILED(hr)) {
+                wchar_t reason[256] = {0}, message[1024];
+                if (!mount && hr == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION))
+                    wcscpy_s(reason, ARRAYSIZE(reason), L"Close open files and folders on the disk and try again.");
+                else
+                    FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
+                                   HRESULT_FACILITY(hr) == FACILITY_WIN32 ? HRESULT_CODE(hr) : (DWORD)hr,
+                                   0, reason, ARRAYSIZE(reason), NULL);
+                swprintf_s(message, ARRAYSIZE(message), L"Could not %s the disk for \"%s\" (0x%08X). %s",
+                           mount ? L"mount" : L"unmount", asb_vm_name(vm), hr, reason);
+                ui_log(L"%s", message);
+                ui_show_alert(message);
+            }
+            send_vm_list();
+        }
     } else if (wcscmp(action, L"startVm") == 0) {
         if (!g_prereq_ok) {
             webview2_post(g_prereq_reboot_pending
@@ -1702,6 +1725,17 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SIZE:
         webview2_resize(hwnd);
         return 0;
+
+    case WM_DEVICECHANGE:
+    case WM_ACTIVATE:
+        if ((msg == WM_ACTIVATE && LOWORD(wp) != WA_INACTIVE) ||
+            (msg == WM_DEVICECHANGE && (wp == DBT_DEVNODES_CHANGED || wp == DBT_DEVICEARRIVAL ||
+                                        wp == DBT_DEVICEREMOVECOMPLETE))) {
+            for (int i = 0; i < asb_vm_count(); ++i)
+                asb_vm_instance(asb_vm_get(i))->host_disk_check_after = 0;
+            ui_refresh_from_core();
+        }
+        break;
 
     case WM_MEASUREITEM:
         if (((MEASUREITEMSTRUCT *)lp)->CtlType == ODT_MENU) {

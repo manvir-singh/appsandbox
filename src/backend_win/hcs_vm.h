@@ -118,6 +118,8 @@ typedef struct {
     volatile LONG legacy_disk_resize_supported;
     BOOL        state_save_pending;
     wchar_t     physical_disk_id[MAX_PATH];
+    BOOL        host_disk_mounted;
+    ULONGLONG   host_disk_check_after;
 } VmInstance;
 
 /* Initialize HCS - loads computecore.dll dynamically.

@@ -20,7 +20,7 @@
 
 #pragma comment(lib, "user32.lib")
 
-#define INPUT_BATCH_PACKETS 32
+#define INPUT_RECV_PACKETS 32
 
 typedef struct {
     BYTE scan[2][256];
@@ -202,23 +202,15 @@ static void inject_unicode(const InputPacket *pkt)
         input_log("SendInput(UNICODE) failed: %lu", GetLastError());
 }
 
-static void inject_relative_mouse(const InputPacket *packets, UINT count)
+static void inject_relative_mouse(const InputPacket *pkt)
 {
-    INPUT moves[INPUT_BATCH_PACKETS];
-    ZeroMemory(moves, count * sizeof(*moves));
-    for (UINT i = 0; i < count; ++i) {
-        moves[i].type = INPUT_MOUSE;
-        moves[i].mi.dx = (LONG)(INT32)packets[i].param1;
-        moves[i].mi.dy = (LONG)(INT32)packets[i].param2;
-        moves[i].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE;
-    }
+    INPUT move = {0};
+    move.type = INPUT_MOUSE;
+    move.mi.dx = (LONG)(INT32)pkt->param1;
+    move.mi.dy = (LONG)(INT32)pkt->param2;
+    move.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE;
     switch_to_input_desktop();
-    UINT sent = SendInput(count, moves, sizeof(*moves));
-    /* Keep the individual send attempts if Windows accepts only part of a batch. */
-    if (count > 1) {
-        for (; sent < count; ++sent)
-            SendInput(1, &moves[sent], sizeof(*moves));
-    }
+    SendInput(1, &move, sizeof(move));
 }
 
 static void inject_physical_key(const InputPacket *pkt, PhysicalKeyState *keys)
@@ -310,7 +302,7 @@ static BOOL disable_gamepads(AsbConn *c, AsbGuestGamepads *gamepads, UINT *versi
 
 static void handle_conn(AsbConn *c)
 {
-    InputPacket packets[INPUT_BATCH_PACKETS];
+    InputPacket packets[INPUT_RECV_PACKETS];
     PhysicalKeyState keys = {0};
     UINT keyboard_version = 1;
     UINT mouse_version = 0;
@@ -332,10 +324,10 @@ static void handle_conn(AsbConn *c)
     for (;;) {
         /* Wake for deferred gamepad reports even if the host sends no further
          * input. Preserve partial packets across those wakeups. */
-        if (gamepads.pending) {
+        if (gamepads.pending && next_packet == packet_count) {
             if (!asb_guest_gamepads_retry(&gamepads) && !disable_gamepads(c, &gamepads, &gamepad_version))
                 break;
-            if (gamepads.pending && next_packet == packet_count) {
+            if (gamepads.pending) {
                 int available = asb_poll(c, ASB_GAMEPAD_RETRY_MS);
                 if (available < 0) {
                     input_log("Input connection closed while retrying gamepad reports after %u packets.", total_packets);
@@ -379,17 +371,8 @@ static void handle_conn(AsbConn *c)
                 break;
             mouse_version = reply.param1;
         } else if (pkt.type == INPUT_MOUSE_RELATIVE) {
-            if (mouse_version >= INPUT_MOUSE_VERSION && pkt.param3 == 0) {
-                /* Batch only adjacent reports already received. Preserve each delta
-                   and process intervening clicks, keys and queries in wire order. */
-                UINT first = next_packet - 1;
-                while (next_packet < packet_count && packets[next_packet].magic == INPUT_MAGIC &&
-                       packets[next_packet].type == INPUT_MOUSE_RELATIVE && !packets[next_packet].param3)
-                    ++next_packet;
-                UINT count = next_packet - first;
-                total_packets += count - 1;
-                inject_relative_mouse(&packets[first], count);
-            }
+            if (mouse_version >= INPUT_MOUSE_VERSION && pkt.param3 == 0)
+                inject_relative_mouse(&pkt);
         } else if (pkt.type == INPUT_MOUSE_POSITION_QUERY) {
             POINT point;
             InputPacket reply = {INPUT_MAGIC, INPUT_MOUSE_POSITION_REPLY,

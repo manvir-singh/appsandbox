@@ -42,8 +42,7 @@ static BOOL bus_request(AsbGuestGamepads *pads, DWORD code, void *data, DWORD si
     ResetEvent(io.hEvent);
     if (DeviceIoControl(pads->bus, code, data, size, NULL, 0, &transferred, &io)) return TRUE;
     if (GetLastError() != ERROR_IO_PENDING) return FALSE;
-    DWORD timeout = code == VIGEM_WAIT_READY ? 5000 : 1000;
-    if (WaitForSingleObject(io.hEvent, timeout) == WAIT_OBJECT_0)
+    if (WaitForSingleObject(io.hEvent, 1000) == WAIT_OBJECT_0)
         return GetOverlappedResult(pads->bus, &io, &transferred, FALSE);
 
     CancelIoEx(pads->bus, &io);
@@ -89,12 +88,47 @@ BOOL asb_guest_gamepads_open(AsbGuestGamepads *pads)
     return pads->bus != NULL;
 }
 
+static void cancel_ready(AsbGuestGamepads *pads, unsigned slot)
+{
+    AsbGamepadReady *ready = &pads->ready[slot];
+    if (!ready->deadline) return;
+
+    DWORD transferred;
+    CancelIoEx(pads->bus, &ready->io);
+    GetOverlappedResult(pads->bus, &ready->io, &transferred, TRUE);
+    ready->deadline = 0;
+}
+
 void asb_guest_gamepads_close(AsbGuestGamepads *pads)
 {
+    for (unsigned slot = 0; slot < INPUT_GAMEPAD_SLOTS; ++slot) {
+        cancel_ready(pads, slot);
+        if (pads->ready[slot].io.hEvent) CloseHandle(pads->ready[slot].io.hEvent);
+    }
     /* The driver removes all devices owned by this bus handle when it closes. */
     if (pads->bus) CloseHandle(pads->bus);
     if (pads->event) CloseHandle(pads->event);
     ZeroMemory(pads, sizeof(*pads));
+}
+
+static BOOL begin_ready(AsbGuestGamepads *pads, unsigned slot, ULONG serial)
+{
+    AsbGamepadReady *ready = &pads->ready[slot];
+    HANDLE event = ready->io.hEvent;
+    if (!event) event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!event) return FALSE;
+    ZeroMemory(&ready->io, sizeof(ready->io));
+    ready->io.hEvent = event;
+    ready->request[0] = sizeof(ready->request);
+    ready->request[1] = serial;
+
+    /* PnP can take seconds. Keep receiving mouse and keyboard input while the
+       driver waits for the virtual device to become operational. */
+    if (DeviceIoControl(pads->bus, VIGEM_WAIT_READY, ready->request, sizeof(ready->request),
+                        NULL, 0, NULL, &ready->io)) return TRUE;
+    if (GetLastError() != ERROR_IO_PENDING) return FALSE;
+    ready->deadline = GetTickCount64() + 5000;
+    return TRUE;
 }
 
 static BOOL attach_gamepad(AsbGuestGamepads *pads, unsigned slot)
@@ -104,10 +138,8 @@ static BOOL attach_gamepad(AsbGuestGamepads *pads, unsigned slot)
         const ULONG xbox360_wired = 0;
         VigemAttach attach = { sizeof(attach), serial, xbox360_wired, 0x045E, 0x028E };
         if (bus_request(pads, VIGEM_ATTACH, &attach, sizeof(attach))) {
-            ULONG ready[] = { sizeof(ready), serial };
-            if (!bus_request(pads, VIGEM_WAIT_READY, ready, sizeof(ready))) return FALSE;
             pads->serials[slot] = serial;
-            return TRUE;
+            return begin_ready(pads, slot, serial);
         }
         DWORD error = GetLastError();
         if (error != ERROR_INVALID_PARAMETER && error != ERROR_ALREADY_EXISTS) return FALSE;
@@ -119,14 +151,16 @@ static BOOL submit_state(AsbGuestGamepads *pads, unsigned slot, AsbGamepadState 
 {
     VigemReport report = { sizeof(report), pads->serials[slot], state };
     UINT32 bit = 1u << slot;
-    if (bus_request(pads, VIGEM_XUSB_STATE, &report, sizeof(report))) {
-        pads->pending &= ~bit;
-        return TRUE;
+    if (!pads->ready[slot].deadline) {
+        if (bus_request(pads, VIGEM_XUSB_STATE, &report, sizeof(report))) {
+            pads->pending &= ~bit;
+            return TRUE;
+        }
+        if (GetLastError() != ERROR_NO_MORE_ITEMS) return FALSE;
     }
-    if (GetLastError() != ERROR_NO_MORE_ITEMS) return FALSE;
 
-    /* ViGEmBus only caches a changed XUSB report when a guest USB read is
-     * pending. Keep the latest state until the driver can deliver it. */
+    /* Keep the latest state until the device is ready and the driver has
+       a guest USB read pending to deliver it. */
     if (!pads->pending) pads->retry_at = GetTickCount64() + ASB_GAMEPAD_RETRY_MS;
     pads->pending_state[slot] = state;
     pads->pending |= bit;
@@ -139,8 +173,22 @@ BOOL asb_guest_gamepads_retry(AsbGuestGamepads *pads)
     if (!pads->pending || now < pads->retry_at) return TRUE;
     pads->retry_at = now + ASB_GAMEPAD_RETRY_MS;
     for (unsigned slot = 0; slot < INPUT_GAMEPAD_SLOTS; ++slot) {
-        if ((pads->pending & (1u << slot)) && !submit_state(pads, slot, pads->pending_state[slot]))
-            return FALSE;
+        if (!(pads->pending & (1u << slot))) continue;
+        AsbGamepadReady *ready = &pads->ready[slot];
+        if (ready->deadline) {
+            DWORD transferred;
+            if (!GetOverlappedResult(pads->bus, &ready->io, &transferred, FALSE)) {
+                if (GetLastError() != ERROR_IO_INCOMPLETE) {
+                    ready->deadline = 0;
+                    return FALSE;
+                }
+                if (now < ready->deadline) continue;
+                SetLastError(ERROR_TIMEOUT);
+                return FALSE;
+            }
+            ready->deadline = 0;
+        }
+        if (!submit_state(pads, slot, pads->pending_state[slot])) return FALSE;
     }
     return TRUE;
 }
@@ -151,6 +199,7 @@ BOOL asb_guest_gamepads_receive(AsbGuestGamepads *pads, const InputPacket *packe
         unsigned slot = packet->param1;
         if (slot >= INPUT_GAMEPAD_SLOTS || packet->param2 || packet->param3 || !pads->serials[slot])
             return TRUE;
+        cancel_ready(pads, slot);
         ULONG detach[] = { sizeof(detach), pads->serials[slot] };
         if (!bus_request(pads, VIGEM_DETACH, detach, sizeof(detach))) return FALSE;
         pads->serials[slot] = 0;

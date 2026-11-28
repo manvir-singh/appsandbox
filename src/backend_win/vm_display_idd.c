@@ -311,6 +311,7 @@ struct VmDisplayIdd {
     volatile LONG  mouse_version;
     volatile BOOL  frame_connected;
     BOOL           relative_mouse;
+    UINT64         mouse_send_failures;
     volatile BOOL  input_sizing;
     UINT           mouse_buttons;
     BOOL           raw_absolute_valid;
@@ -642,11 +643,12 @@ static BOOL send_input_locked(VmDisplayIdd *d,UINT32 type,UINT32 p1,UINT32 p2,UI
     return !error || error==ERROR_ACCESS_DENIED;
 }
 
-static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT32 p3)
+static BOOL send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT32 p3)
 {
     AcquireSRWLockExclusive(&d->input_lock);
-    send_input_locked(d, type, p1, p2, p3);
+    BOOL sent = send_input_locked(d, type, p1, p2, p3);
     ReleaseSRWLockExclusive(&d->input_lock);
+    return sent;
 }
 
 #define GAMEPAD_ATTACH_DELAY_MS  64
@@ -817,6 +819,11 @@ static void idd_update_relative_mouse(VmDisplayIdd *d)
         d->raw_absolute_valid = FALSE;
     }
     ReleaseSRWLockExclusive(&g_mouse_capture_lock);
+    if (!d->relative_mouse && d->mouse_send_failures) {
+        UINT64 failures = d->mouse_send_failures;
+        d->mouse_send_failures = 0;
+        idd_log(d, L"Failed to send %llu captured mouse movement report(s).", failures);
+    }
     if (sync_absolute && d->frame_width && d->frame_height) {
         if (d->mouse_version >= INPUT_MOUSE_VERSION) {
             if (++d->mouse_sync_id == 0) ++d->mouse_sync_id;
@@ -4108,9 +4115,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 } else {
                     d->raw_absolute_valid = FALSE;
                 }
-                if (dx || dy) {
-                    send_input(d, INPUT_MOUSE_RELATIVE, (UINT32)dx, (UINT32)dy, 0);
-                }
+                /* Forward raw relative counts from the input message itself. */
+                if ((dx || dy) && !send_input(d, INPUT_MOUSE_RELATIVE, (UINT32)dx, (UINT32)dy, 0))
+                    ++d->mouse_send_failures;
             }
         }
         break;
